@@ -38,10 +38,10 @@
 - Números ≥ 15 → Referência de produção (ativa `tempoProducao`)
 - Números de 1 a 6 → Alternam os seguintes estados de parada:
   - `1` → Banheiro
-  - `3` → Manutenção
-  - `4` → Falta de material
-  - `5` → Quebra de agulha
-  - `6` → Troca de peça
+  - `2` → Manutenção
+  - `3` → Falta de material
+  - `4` → Quebra de agulha
+  - `5` → Troca de peça
 
 > Só uma parada pode estar ativa por vez.
 
