@@ -48,7 +48,6 @@
 ### 🔄 Encoder e RPM
 
 - A cada segundo, os pulsos são contados para calcular o **RPM**.
-- O valor é mostrado no LCD junto com a carga da **CPU (%)**.
 
 ### 📡 Envio MQTT
 
