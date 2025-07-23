@@ -29,10 +29,10 @@ byte rowPins[ROWS] = {12, 33, 25, 27};
 byte colPins[COLS] = {14, 13, 26};
 Keypad keypad = Keypad(makeKeymap(keys), rowPins, colPins, ROWS, COLS);
 
-const char* ssid = "CLAYRAFA";
-const char* password = "kadu1973";
-const char* mqtt_server = "192.168.100.24";
-const int mqtt_port = 1883;
+const char* ssid = "NOME-REDE";
+const char* password = "SENHA-REDE";
+const char* mqtt_server = "IP-BROKER";
+const int mqtt_port = PORTA-BROKER;
 const char* mqtt_topic = "esp32";
 // const char* mqtt_user = "esp32";
 // const char* mqtt_password = "Projetoesp32";
