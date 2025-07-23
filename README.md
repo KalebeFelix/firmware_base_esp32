@@ -69,7 +69,6 @@ Tópico: esp32
 "tempoQuebraAgulha": false,
 "tempoTrocaPeca": false,
 "rpm": 158.50,
-"cpuLoad": 23.4,
-"heapLivre": 184352,
-"heapMin": 163424
+"cpuLoad": 52.4,
+"heapLoad": 35.3
 }
