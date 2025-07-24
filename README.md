@@ -61,7 +61,7 @@ Tópico: esp32
 {
 "maquina_id": "MAQ01",
 "operador": "AB12CD34",
-"referencia": "REF_123",
+"referencia": "123456",
 "tempoMaquina": true,
 "tempoProducao": true,
 "tempoBanheiro": false,
