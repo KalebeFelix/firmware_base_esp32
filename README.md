@@ -51,7 +51,7 @@
 
 ### 📡 Envio MQTT
 
-- A cada 3 segundos, um JSON com todos os dados é publicado em:
+- A cada 5 segundos, um JSON com todos os dados é publicado em:
 Tópico: esp32
 ---
 
