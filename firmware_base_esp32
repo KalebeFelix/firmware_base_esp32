@@ -6,6 +6,7 @@
   #include <Keypad.h>
   #include <SPI.h>
   #include <MFRC522.h>
+  #include <ArduinoJson.h>
   #include "esp_heap_caps.h"
   #include "freertos/FreeRTOS.h"
   #include "freertos/task.h"
@@ -40,8 +41,8 @@
 
   // WiFiClientSecure secureClient;
   // PubSubClient client(secureClient);
-  WiFiClient EspMAQ01;
-  PubSubClient client(EspMAQ01);
+  WiFiClient espClient;
+  PubSubClient client(espClient);
   MFRC522 rfid(SS_PIN, RST_PIN);
 
   String operador_id = "";
@@ -95,10 +96,10 @@
       if (key == '#') {
         int valor = buffer.toInt();
         if (valor >= 15) {
-          referencia = "REF_" + buffer;
+          referencia = buffer;
           tempoProducao = true;
           lcd.setCursor(0, 1);
-          lcd.print("Referencia: " + referencia);
+          lcd.print("REF: " + referencia);
         } else {
           bool* paradaAtual = nullptr;
           if (valor == 1) paradaAtual = &tempoBanheiro;
@@ -132,27 +133,45 @@
   }
 
   void enviarJSON() {
-    float heapPorcentagemUsada = ((heap_caps_get_total_size(MALLOC_CAP_DEFAULT) - esp_get_free_heap_size()) * 100.0) / heap_caps_get_total_size(MALLOC_CAP_DEFAULT);
-    String json = "{";
-    json += "\"maquina_id\":\"" + String(maquina_id) + "\",";
-    json += "\"operador\":\"" + operador_id + "\",";
-    json += "\"referencia\":\"" + referencia + "\",";
-    json += "\"tempoMaquina\":" + String(tempoMaquina ? "true" : "false") + ",";
-    json += "\"tempoProducao\":" + String(tempoProducao ? "true" : "false") + ",";
-    json += "\"tempoBanheiro\":" + String(tempoBanheiro ? "true" : "false") + ",";
-    json += "\"tempoManutencao\":" + String(tempoManutencao ? "true" : "false") + ",";
-    json += "\"tempoFaltaMaterial\":" + String(tempoFaltaMaterial ? "true" : "false") + ",";
-    json += "\"tempoQuebraAgulha\":" + String(tempoQuebraAgulha ? "true" : "false") + ",";
-    json += "\"tempoTrocaPeca\":" + String(tempoTrocaPeca ? "true" : "false") + ",";
-    json += "\"rpm\":" + String(rpm, 2) + ",";
-    json += "\"cpuLoad\":" + String(cpuLoad, 1) + ",";
-    json += "\"heapLoad\":" + String(heapPorcentagemUsada);
-    json += "}";
+  StaticJsonDocument<512> doc;
 
-    Serial.println(json);
-    if (client.connected()) client.publish(mqtt_topic, json.c_str());
-    Serial.println("Tamanho Json: " + json.length());
+  float heapPorcentagemUsada = (
+    (heap_caps_get_total_size(MALLOC_CAP_DEFAULT) - esp_get_free_heap_size()) * 100.0
+  ) / heap_caps_get_total_size(MALLOC_CAP_DEFAULT);
+
+  doc["maquina_id"] = maquina_id;
+  doc["operador"] = operador_id;
+  doc["referencia"] = referencia;
+  doc["tempoMaquina"] = tempoMaquina;
+  doc["tempoProducao"] = tempoProducao;
+  doc["tempoBanheiro"] = tempoBanheiro;
+  doc["tempoManutencao"] = tempoManutencao;
+  doc["tempoFaltaMaterial"] = tempoFaltaMaterial;
+  doc["tempoQuebraAgulha"] = tempoQuebraAgulha;
+  doc["tempoTrocaPeca"] = tempoTrocaPeca;
+  doc["rpm"] = rpm;
+  doc["cpuLoad"] = cpuLoad;
+  doc["heapLoad"] = heapPorcentagemUsada;
+
+  char jsonBuffer[512];
+  size_t len = serializeJson(doc, jsonBuffer);
+
+  Serial.println("JSON Gerado:");
+  Serial.println(jsonBuffer);
+  Serial.print("Tamanho JSON: ");
+  Serial.println(len);
+
+  if (client.connected()) {
+    bool enviado = client.publish(mqtt_topic, jsonBuffer);
+    if (enviado) {
+      Serial.println("✅ JSON enviado com sucesso ao broker MQTT.");
+    } else {
+      Serial.println("❌ Falha ao enviar JSON ao broker MQTT.");
+    }
+  } else {
+    Serial.println("⚠️ Cliente MQTT não está conectado.");
   }
+}
 
   void mostrarParadaNoLCD() {
   lcd.setCursor(0, 2);
@@ -167,7 +186,7 @@
   } else if (tempoTrocaPeca) {
     lcd.print("Troca de Peca      ");
   } else {
-    lcd.print("                   ");  // Limpa a linha se nenhuma parada
+    lcd.print("                    "); // Limpa a linha se nenhuma parada
   }
 }
 
@@ -186,7 +205,7 @@
     client.setServer(mqtt_server, mqtt_port);
     while (!client.connected()) {
       Serial.print("Conectando ao MQTT...");
-      if (client.connect("ESP32Client")) {
+      if (client.connect(maquina_id)) {
         Serial.println("Conectado ao MQTT!");
       } else {
         Serial.print("Falha, rc=");
