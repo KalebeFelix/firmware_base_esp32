@@ -99,6 +99,8 @@
           referencia = buffer;
           tempoProducao = true;
           lcd.setCursor(0, 1);
+          lcd.print("                    ");
+          lcd.setCursor(0, 1);
           lcd.print("REF: " + referencia);
         } else {
           bool* paradaAtual = nullptr;
@@ -253,7 +255,7 @@
     }
 
     static unsigned long ultimaMensagem = 0;
-    if (millis() - ultimaMensagem >= 3000) {
+    if (millis() - ultimaMensagem >= 5000) {
       enviarJSON();
       ultimaMensagem = millis();
     }
