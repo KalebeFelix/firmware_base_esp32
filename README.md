@@ -59,6 +59,7 @@ Tópico: esp32
 
 ```json
 {
+"maquina_id": "MAQ01",
 "operador": "AB12CD34",
 "referencia": "REF_123",
 "tempoMaquina": true,
@@ -68,7 +69,7 @@ Tópico: esp32
 "tempoFaltaMaterial": false,
 "tempoQuebraAgulha": false,
 "tempoTrocaPeca": false,
-"rpm": 158.50,
+"rpm": 1508.50,
 "cpuLoad": 52.4,
 "heapLoad": 35.3
 }
