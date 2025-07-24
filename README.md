@@ -1,67 +1,93 @@
-# 🧵 Projeto ESP32 - Firmware base
+# 📟 Sistema de Monitoramento de Produção - ESP32
 
-## 🚀 Funcionalidades
+Este projeto implementa um firmware completo para ESP32, voltado ao monitoramento de produção industrial com controle de operador, registro de paradas, velocidade de máquina (RPM), uso de recursos e comunicação via MQTT.
 
-- 📶 Conexão Wi-Fi com autenticação
-- 🔐 Login e logout de operadores via **cartão RFID**
-- 🔢 Registro de **referências de produção** e tipos de paradas via teclado
-- 🧭 Cálculo e exibição do **RPM da máquina**
-- 📟 Feedback ao operador via **LCD I2C**
-- 📡 Envio periódico de dados em formato **JSON** para o broker MQTT
-- 🧠 Monitoramento do uso da **CPU** e da **memória heap**
+## 🚀 Funcionalidades Principais
 
----
-
-## 🔌 Componentes Utilizados
-
-| Componente            | Função                                     |
-|-----------------------|--------------------------------------------|
-| ESP32                 | Microcontrolador principal                 |
-| MFRC522 RFID          | Leitura de cartões RFID                    |
-| Encoder               | Cálculo do RPM da máquina                  |
-| Teclado Matricial 4x3 | Entrada de dados (referência ou parada)   |
-| Display LCD I2C 20x4  | Exibição de informações ao operador        |
-| Broker MQTT           | Recebimento remoto dos dados               |
+- 📲 **Login por RFID**: operadores se identificam ao aproximar seu cartão RFID.
+- ⌨️ **Controle por Teclado**: permite inserir códigos de referência de produção e registrar paradas.
+- 📉 **Cálculo de RPM**: utiliza um sensor de pulso (encoder) conectado à máquina.
+- 🧠 **Medição de uso da CPU e RAM** do ESP32.
+- 📡 **Envio de dados para broker MQTT** em tempo real, a cada 5 segundos.
+- 📺 **Interface LCD 20x4**: exibe status do operador, referência, paradas e RPM.
 
 ---
 
-## 🧠 Lógica de Funcionamento
+## ⚙️ Componentes Utilizados
 
-### 👤 Identificação do Operador (RFID)
+- ESP32
+- Leitor RFID MFRC522
+- Display LCD I2C 20x4
+- Keypad matricial 4x3
+- Sensor de pulso (encoder óptico ou magnético)
+- Broker MQTT (ex: Mosquitto)
+- Conexão Wi-Fi
 
-- Ao aproximar um cartão RFID válido, o sistema realiza o login.
-- O LCD exibe o ID do operador e solicita uma referência.
-- Um segundo toque no mesmo cartão efetua logout e reseta estados.
-
-### ⌨️ Registro via Teclado
-
-- Números ≥ 15 → Referência de produção (ativa `tempoProducao`)
-- Números de 1 a 6 → Alternam os seguintes estados de parada:
-  - `1` → Banheiro
-  - `2` → Manutenção
-  - `3` → Falta de material
-  - `4` → Quebra de agulha
-  - `5` → Troca de peça
-
-> Só uma parada pode estar ativa por vez.
-
-### 🔄 Encoder e RPM
-
-- A cada segundo, os pulsos são contados para calcular o **RPM**.
-
-### 📡 Envio MQTT
-
-- A cada 5 segundos, um JSON com todos os dados é publicado em:
-Tópico: esp32
 ---
 
-## 🧪 Exemplo de Payload JSON
+## 🧩 Lógica de Funcionamento
+
+### ✅ 1. Login e Logout via RFID
+- Quando **nenhum operador está logado**, ao passar um cartão RFID válido, o sistema realiza o **login**.
+  - Ativa `tempoMaquina = true`
+  - Exibe mensagem `"Login: <UID>"` e `"Insira Referencia..."`
+
+- Se o mesmo operador passar o cartão novamente, realiza o **logout**:
+  - Zera operador, referência, produção e paradas.
+  - Exibe `"Logout Realizado"` e `"Efetue o Login!"`
+
+- Se outro operador tentar logar enquanto já há um ativo, a tentativa é rejeitada.
+
+---
+
+### 🔢 2. Inserção de Referência e Paradas (via Teclado)
+
+- Após login, o operador pode digitar **um número no teclado e pressionar `#`**.
+- O valor digitado determina a ação:
+
+#### ℹ️ Referência de Produção
+- **Se o número for `15` ou maior**, é considerado uma **referência válida**:
+  - Se nenhuma referência ativa, ativa `tempoProducao = true`
+  - Exibe `"REF: <referencia>"`
+- Se já houver uma referência ativa, ignora e exibe `"REF já ativa!"`.
+
+#### ⛔ Paradas de Produção
+- **Se o número for de `1` a `5`**, ativa/desativa os tipos de parada:
+  | Código | Parada             |
+  |--------|--------------------|
+  | 1      | Banheiro           |
+  | 2      | Manutenção         |
+  | 3      | Falta de Material  |
+  | 4      | Quebra de Agulha   |
+  | 5      | Troca de Peça      |
+
+- Somente uma parada pode estar ativa por vez.
+
+#### 🔄 Finalizar Referência
+- Para **finalizar a produção atual**:
+  - Pressione `*` e depois `#`
+  - Isso **limpa a referência** e desativa `tempoProducao`
+  - Exibe `"REF finalizada"`
+
+---
+
+### ⚙️ 3. Medição de RPM
+- Um **sensor de pulso (encoder)** gera interrupções no pino `ENCODER_PIN`.
+- A cada segundo, o sistema calcula:
+  
+RPM = (pulsos * 60) / PULSES_PER_REV
+- Mostra o valor no LCD: `RPM: xx.xx`
+
+---
+
+### 📊 4. Monitoramento de Sistema
+- A cada 5 segundos, o sistema envia um JSON via MQTT com os seguintes dados:
 
 ```json
 {
 "maquina_id": "MAQ01",
-"operador": "AB12CD34",
-"referencia": "123456",
+"operador": "UID_RFID",
+"referencia": "123",
 "tempoMaquina": true,
 "tempoProducao": true,
 "tempoBanheiro": false,
@@ -69,7 +95,7 @@ Tópico: esp32
 "tempoFaltaMaterial": false,
 "tempoQuebraAgulha": false,
 "tempoTrocaPeca": false,
-"rpm": 1508.50,
-"cpuLoad": 52.4,
-"heapLoad": 35.3
+"rpm": 240.00,
+"cpuLoad": 52.5,
+"heapLoad": 34.7
 }
