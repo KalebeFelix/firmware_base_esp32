@@ -29,10 +29,11 @@
   byte colPins[COLS] = {14, 13, 26};
   Keypad keypad = Keypad(makeKeymap(keys), rowPins, colPins, ROWS, COLS);
 
-  const char* ssid = "CLAYRAFA";
-  const char* password = "kadu1973";
-  const char* mqtt_server = "192.168.100.24";
-  const int mqtt_port = 1883;
+  const char* maquina_id = "MAQ01";
+  const char* ssid = "SSID-REDE";
+  const char* password = "SENHA-REDE";
+  const char* mqtt_server = "IP-BROKER";
+  const int mqtt_port = PORTA;
   const char* mqtt_topic = "esp32";
   // const char* mqtt_user = "esp32";
   // const char* mqtt_password = "Projetoesp32";
@@ -133,6 +134,7 @@
   void enviarJSON() {
     float heapPorcentagemUsada = ((heap_caps_get_total_size(MALLOC_CAP_DEFAULT) - esp_get_free_heap_size()) * 100.0) / heap_caps_get_total_size(MALLOC_CAP_DEFAULT);
     String json = "{";
+    json += "\"maquina_id\":\"" + String(maquina_id) + "\",";
     json += "\"operador\":\"" + operador_id + "\",";
     json += "\"referencia\":\"" + referencia + "\",";
     json += "\"tempoMaquina\":" + String(tempoMaquina ? "true" : "false") + ",";
@@ -228,7 +230,7 @@
       attachInterrupt(digitalPinToInterrupt(ENCODER_PIN), countPulse, RISING);
       cpuLoad = getCPULoad();
       lcd.setCursor(0, 3);
-      lcd.printf("RPM: %.2f CPU: %.1f%%", rpm, cpuLoad);
+      lcd.printf("RPM: %.2f", rpm);
     }
 
     static unsigned long ultimaMensagem = 0;
