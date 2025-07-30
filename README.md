@@ -29,7 +29,7 @@ Este projeto implementa um firmware completo para ESP32, voltado ao monitorament
 
 ### ✅ 1. Login e Logout via RFID
 - Quando **nenhum operador está logado**, ao passar um cartão RFID válido, o sistema realiza o **login**.
-  - Ativa `tempoMaquina = true`
+  - Ativa `tempoTrabalho = true`
   - Exibe mensagem `"Login: <UID>"` e `"Insira Referencia..."`
 
 - Se o mesmo operador passar o cartão novamente, realiza o **logout**:
@@ -62,6 +62,7 @@ Este projeto implementa um firmware completo para ESP32, voltado ao monitorament
   | 5      | Troca de Peça      |
 
 - Somente uma parada pode estar ativa por vez.
+- Ao ser ativado qualquer tipo de parada, o tempo produção vira false.
 
 #### 🔄 Finalizar Referência
 - Para **finalizar a produção atual**:
@@ -77,6 +78,7 @@ Este projeto implementa um firmware completo para ESP32, voltado ao monitorament
   
 RPM = (pulsos * 60) / PULSES_PER_REV
 - Mostra o valor no LCD: `RPM: xx.xx`
+- Será utilizado para saber o tempo de maquina. 
 
 ---
 
@@ -87,8 +89,8 @@ RPM = (pulsos * 60) / PULSES_PER_REV
 {
 "maquina_id": "MAQ01",
 "operador": "UID_RFID",
-"referencia": "123",
-"tempoMaquina": true,
+"ref_op": "123",
+"tempoTrabalho": true,
 "tempoProducao": true,
 "tempoBanheiro": false,
 "tempoManutencao": false,
