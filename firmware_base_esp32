@@ -1,314 +1,332 @@
-#include <WiFi.h>
-#include <PubSubClient.h>
-#include <Wire.h>
-#include <LiquidCrystal_I2C.h>
-#include <Keypad.h>
-#include <SPI.h>
-#include <MFRC522.h>
-#include <ArduinoJson.h>
-#include "esp_heap_caps.h"
-#include "freertos/FreeRTOS.h"
-#include "freertos/task.h"
+  #include <WiFi.h>
+  #include <PubSubClient.h>
+  #include <Wire.h>
+  #include <LiquidCrystal_I2C.h>
+  #include <Keypad.h>
+  #include <SPI.h>
+  #include <MFRC522.h>
+  #include <ArduinoJson.h>
+  #include "esp_heap_caps.h"
+  #include "freertos/FreeRTOS.h"
+  #include "freertos/task.h"
 
-#define RST_PIN 4
-#define SS_PIN 5
-#define ENCODER_PIN 34
-#define PULSES_PER_REV 20
+  #define RST_PIN 4
+  #define SS_PIN 5
+  #define ENCODER_PIN 34
+  #define PULSES_PER_REV 20
 
-LiquidCrystal_I2C lcd(0x27, 20, 4);
+  LiquidCrystal_I2C lcd(0x27, 20, 4);
 
-const byte ROWS = 4;
-const byte COLS = 3;
-char keys[ROWS][COLS] = {
-  {'1','2','3'},
-  {'4','5','6'},
-  {'7','8','9'},
-  {'*','0','#'}
-};
-byte rowPins[ROWS] = {12, 33, 25, 27};
-byte colPins[COLS] = {14, 13, 26};
-Keypad keypad = Keypad(makeKeymap(keys), rowPins, colPins, ROWS, COLS);
+  const byte ROWS = 4;
+  const byte COLS = 3;
+  char keys[ROWS][COLS] = {
+    {'1','2','3'},
+    {'4','5','6'},
+    {'7','8','9'},
+    {'*','0','#'}
+  };
+  byte rowPins[ROWS] = {12, 33, 25, 27};
+  byte colPins[COLS] = {14, 13, 26};
+  Keypad keypad = Keypad(makeKeymap(keys), rowPins, colPins, ROWS, COLS);
 
-const char* maquina_id = "MAQ01";
-const char* ssid = "SSID-REDE";
-const char* password = "SENHA-REDE";
-const char* mqtt_server = "IP-BROKER";
-const int mqtt_port = PORTA;
-const char* mqtt_topic = "esp32";
+  const char* maquina_id = "MAQ01";
+  const char* ssid = "SSID-REDE";
+  const char* password = "SENHA-REDE";
+  const char* mqtt_server = "IP-BROKER";
+  const int mqtt_port = PORTA;
+  const char* mqtt_topic = "esp32";
 
-WiFiClient espClient;
-PubSubClient client(espClient);
-MFRC522 rfid(SS_PIN, RST_PIN);
+  WiFiClient espClient;
+  PubSubClient client(espClient);
+  MFRC522 rfid(SS_PIN, RST_PIN);
 
-String operador_id = "";
-String referencia = "";
-bool tempoMaquina = false, tempoProducao = false;
-bool tempoBanheiro = false, tempoManutencao = false, tempoFaltaMaterial = false, tempoQuebraAgulha = false, tempoTrocaPeca = false;
+  String operador_id = "";
+  String referencia = "";
+  bool tempoTrabalho = false, tempoProducao = false;
+  bool tempoBanheiro = false, tempoManutencao = false, tempoFaltaMaterial = false, tempoQuebraAgulha = false, tempoTrocaPeca = false;
 
-volatile unsigned long pulseCount = 0;
-unsigned long lastRPMCheck = 0;
-float rpm = 0;
-float cpuLoad = 0.0f;
+  volatile unsigned long pulseCount = 0;
+  unsigned long lastRPMCheck = 0;
+  float rpm = 0;
+  float cpuLoad = 0.0f;
 
-void IRAM_ATTR countPulse() {
-  pulseCount++;
-}
-
-void resetarParadas() {
-  tempoBanheiro = tempoManutencao = tempoFaltaMaterial = tempoQuebraAgulha = tempoTrocaPeca = false;
-}
-
-void verificarRFID() {
-  if (!rfid.PICC_IsNewCardPresent() || !rfid.PICC_ReadCardSerial()) return;
-  String uid = "";
-  for (byte i = 0; i < rfid.uid.size; i++) {
-    if (rfid.uid.uidByte[i] < 0x10) uid += "0";
-    uid += String(rfid.uid.uidByte[i], HEX);
-  }
-  uid.toUpperCase();
-
-  if (operador_id == "") {
-    operador_id = uid;
-    tempoMaquina = true;
-    lcd.clear();
-    lcd.setCursor(0, 0);
-    lcd.print("Login: " + operador_id);
-    lcd.setCursor(0, 1);
-    lcd.print("Insira Referencia...");
-  } else if (operador_id == uid) {
-    operador_id = "";
-    tempoMaquina = tempoProducao = false;
-    referencia = "";
-    resetarParadas();
-    lcd.clear();
-    lcd.setCursor(0, 0);
-    lcd.print("Logout Realizado");
-    lcd.setCursor(0, 1);
-    lcd.print("Efetue o Login!");
-  } else {
-    lcd.clear();
-    lcd.setCursor(0, 0);
-    lcd.print("Outro operador");
-    lcd.setCursor(0, 1);
-    lcd.print("ativo no momento!");
-    delay(2000);
-    lcd.clear();
-    lcd.setCursor(0, 0);
-    lcd.print("Login: " + operador_id);
-    lcd.setCursor(0, 1);
-    lcd.print("REF: " + referencia);
+  void IRAM_ATTR countPulse() {
+    pulseCount++;
   }
 
-  rfid.PICC_HaltA();
-  rfid.PCD_StopCrypto1();
-  delay(1000);
-}
-
-void verificarTeclado() {
-  if (operador_id == "") return;
-
-  static String buffer = "";
-  static bool asteriscoPressionado = false;
-
-  char key = keypad.getKey();
-  if (!key) return;
-
-  if (key == '*') {
-    asteriscoPressionado = true;
-    buffer = "";  // limpa qualquer entrada anterior
-    return;
+  void resetarParadas() {
+    tempoBanheiro = tempoManutencao = tempoFaltaMaterial = tempoQuebraAgulha = tempoTrocaPeca = false;
   }
 
-  if (key == '#') {
-    if (asteriscoPressionado) {
-      // Finaliza a referência
-      referencia = "";
-      tempoProducao = false;
-      lcd.setCursor(0, 1);
-      lcd.print("REF finalizada     ");
-      delay(2000);
+  void verificarRFID() {
+    if (!rfid.PICC_IsNewCardPresent() || !rfid.PICC_ReadCardSerial()) return;
+    String uid = "";
+    for (byte i = 0; i < rfid.uid.size; i++) {
+      if (rfid.uid.uidByte[i] < 0x10) uid += "0";
+      uid += String(rfid.uid.uidByte[i], HEX);
+    }
+    uid.toUpperCase();
+
+    if (operador_id == "") {
+      operador_id = uid;
+      tempoTrabalho = true;
+      lcd.clear();
+      lcd.setCursor(0, 0);
+      lcd.print("Login: " + operador_id);
       lcd.setCursor(0, 1);
       lcd.print("Insira Referencia...");
-      asteriscoPressionado = false;
-      buffer = "";
+    } else if (operador_id == uid) {
+      operador_id = "";
+      tempoTrabalho = tempoProducao = false;
+      referencia = "";
+      resetarParadas();
+      lcd.clear();
+      lcd.setCursor(0, 0);
+      lcd.print("Logout Realizado");
+      lcd.setCursor(0, 1);
+      lcd.print("Efetue o Login!");
+    } else {
+      lcd.clear();
+      lcd.setCursor(0, 0);
+      lcd.print("Outro operador");
+      lcd.setCursor(0, 1);
+      lcd.print("ativo no momento!");
+      delay(2000);
+      lcd.clear();
+      lcd.setCursor(0, 0);
+      lcd.print("Login: " + operador_id);
+      lcd.setCursor(0, 1);
+      lcd.print("REF: " + referencia);
+    }
+
+    rfid.PICC_HaltA();
+    rfid.PCD_StopCrypto1();
+    delay(1000);
+  }
+
+  void verificarTeclado() {
+    if (operador_id == "") return;
+
+    static String buffer = "";
+    static bool asteriscoPressionado = false;
+
+    char key = keypad.getKey();
+    if (!key) return;
+
+    if (key == '*') {
+      asteriscoPressionado = true;
+      buffer = "";  // limpa qualquer entrada anterior
       return;
     }
 
-    int valor = buffer.toInt();
-    if (valor >= 15) {
-      if (referencia == "") {
-        referencia = buffer;
-        tempoProducao = true;
+    if (key == '#') {
+      if (asteriscoPressionado) {
+        // Finaliza a referência
+        referencia = "";
+        tempoProducao = false;
         lcd.setCursor(0, 1);
-        lcd.print("                    ");
-        lcd.setCursor(0, 1);
-        lcd.print("REF: " + referencia);
-      } else {
-        lcd.setCursor(0, 1);
-        lcd.print("REF ja ativa!      ");
+        lcd.print("REF finalizada     ");
         delay(2000);
         lcd.setCursor(0, 1);
-        lcd.print("                    ");
-        lcd.setCursor(0, 1);
-        lcd.print("REF: " + referencia);
+        lcd.print("Insira Referencia...");
+        asteriscoPressionado = false;
+        buffer = "";
+        return;
       }
-    } else {
-      bool* paradaAtual = nullptr;
-      if (valor == 1) paradaAtual = &tempoBanheiro;
-      else if (valor == 2) paradaAtual = &tempoManutencao;
-      else if (valor == 3) paradaAtual = &tempoFaltaMaterial;
-      else if (valor == 4) paradaAtual = &tempoQuebraAgulha;
-      else if (valor == 5) paradaAtual = &tempoTrocaPeca;
 
-      if (paradaAtual) {
-        if (!(tempoBanheiro || tempoManutencao || tempoFaltaMaterial || tempoQuebraAgulha || tempoTrocaPeca)) {
-          *paradaAtual = true;
-        } else if (*paradaAtual) {
-          *paradaAtual = false;
+      int valor = buffer.toInt();
+      if (valor >= 15) {
+        if (referencia == "") {
+          referencia = buffer;
+          tempoProducao = true;
+          lcd.setCursor(0, 1);
+          lcd.print("                    ");
+          lcd.setCursor(0, 1);
+          lcd.print("REF: " + referencia);
+        } else {
+          lcd.setCursor(0, 1);
+          lcd.print("REF ja ativa!      ");
+          delay(2000);
+          lcd.setCursor(0, 1);
+          lcd.print("                    ");
+          lcd.setCursor(0, 1);
+          lcd.print("REF: " + referencia);
+        }
+      } else {
+        bool* paradaAtual = nullptr;
+        if (valor == 1) paradaAtual = &tempoBanheiro;
+        else if (valor == 2) paradaAtual = &tempoManutencao;
+        else if (valor == 3) paradaAtual = &tempoFaltaMaterial;
+        else if (valor == 4) paradaAtual = &tempoQuebraAgulha;
+        else if (valor == 5) paradaAtual = &tempoTrocaPeca;
+
+        if (paradaAtual) {
+          if (!(tempoBanheiro || tempoManutencao || tempoFaltaMaterial || tempoQuebraAgulha || tempoTrocaPeca)) {
+            *paradaAtual = true;
+            tempoProducao = false;  // Pausar produção quando iniciar qualquer parada
+          } else if (*paradaAtual) {
+            *paradaAtual = false;
+
+            // Verifica se nenhuma outra parada está ativa
+            if (!(tempoBanheiro || tempoManutencao || tempoFaltaMaterial || tempoQuebraAgulha || tempoTrocaPeca)) {
+              tempoProducao = true;  // Retoma produção automaticamente
+            }
+          }
         }
       }
-    }
 
-    buffer = "";
-    asteriscoPressionado = false;
-  } else {
-    buffer += key;
-  }
-}
-
-
-float getCPULoad() {
-  static unsigned long lastIdle = 0, lastTotal = 0;
-  unsigned long idle = ulTaskGetIdleRunTimeCounter();
-  unsigned long total = portGET_RUN_TIME_COUNTER_VALUE();
-  unsigned long idleDelta = idle - lastIdle;
-  unsigned long totalDelta = total - lastTotal;
-  lastIdle = idle;
-  lastTotal = total;
-  if (totalDelta == 0) return 0.0;
-  return (1.0 - ((float)idleDelta / totalDelta)) * 100.0;
-}
-
-void enviarJSON() {
-  StaticJsonDocument<512> doc;
-  size_t totalHeap = heap_caps_get_total_size(MALLOC_CAP_DEFAULT);
-  if (totalHeap == 0) totalHeap = 1;
-
-  float heapPorcentagemUsada = ((totalHeap - esp_get_free_heap_size()) * 100.0) / totalHeap;
-
-  doc["maquina_id"] = maquina_id;
-  doc["operador"] = operador_id;
-  doc["referencia"] = referencia;
-  doc["tempoMaquina"] = tempoMaquina;
-  doc["tempoProducao"] = tempoProducao;
-  doc["tempoBanheiro"] = tempoBanheiro;
-  doc["tempoManutencao"] = tempoManutencao;
-  doc["tempoFaltaMaterial"] = tempoFaltaMaterial;
-  doc["tempoQuebraAgulha"] = tempoQuebraAgulha;
-  doc["tempoTrocaPeca"] = tempoTrocaPeca;
-  doc["rpm"] = roundf(rpm * 100) / 100.0;
-  doc["cpuLoad"] = roundf(cpuLoad * 100) / 100.0;
-  doc["heapLoad"] = roundf(heapPorcentagemUsada * 100) / 100.0;
-
-
-  char jsonBuffer[512];
-  size_t len = serializeJson(doc, jsonBuffer);
-
-  Serial.println("JSON Gerado:");
-  Serial.println(jsonBuffer);
-
-  if (client.connected()) {
-    if (client.publish(mqtt_topic, jsonBuffer)) {
-      Serial.println("✅ JSON enviado com sucesso.");
+      buffer = "";
+      asteriscoPressionado = false;
     } else {
-      Serial.println("❌ Falha ao enviar JSON.");
+      buffer += key;
     }
-  } else {
-    Serial.println("⚠️ MQTT desconectado.");
   }
-}
 
-void mostrarParadaNoLCD() {
-  lcd.setCursor(0, 2);
-  if (tempoBanheiro) lcd.print("Parada: Banheiro   ");
-  else if (tempoManutencao) lcd.print("Parada: Manutencao ");
-  else if (tempoFaltaMaterial) lcd.print("Parada: Falt. Mat. ");
-  else if (tempoQuebraAgulha) lcd.print("Parada: Q. Agulha  ");
-  else if (tempoTrocaPeca) lcd.print("Troca de Peca      ");
-  else lcd.print("                    ");
-}
 
-void conectarWiFi() {
-  WiFi.begin(ssid, password);
-  while (WiFi.status() != WL_CONNECTED) {
-    delay(500);
-    Serial.print(".");
+  float getCPULoad() {
+    static unsigned long lastIdle = 0, lastTotal = 0;
+    unsigned long idle = ulTaskGetIdleRunTimeCounter();
+    unsigned long total = portGET_RUN_TIME_COUNTER_VALUE();
+    unsigned long idleDelta = idle - lastIdle;
+    unsigned long totalDelta = total - lastTotal;
+    lastIdle = idle;
+    lastTotal = total;
+    if (totalDelta == 0) return 0.0;
+    return (1.0 - ((float)idleDelta / totalDelta)) * 100.0;
   }
-  Serial.println("\nWiFi conectado!");
-  Serial.println(WiFi.localIP());
-}
 
-void conectarMQTT() {
-  client.setServer(mqtt_server, mqtt_port);
-  int tentativas = 0;
-  while (!client.connected() && tentativas < 5) {
-    Serial.print("Conectando ao MQTT...");
-    if (client.connect(maquina_id)) {
-      Serial.println("Conectado ao MQTT!");
-      break;
+  void enviarJSON() {
+    StaticJsonDocument<512> doc;
+    size_t totalHeap = heap_caps_get_total_size(MALLOC_CAP_DEFAULT);
+    if (totalHeap == 0) totalHeap = 1;
+
+    float heapPorcentagemUsada = ((totalHeap - esp_get_free_heap_size()) * 100.0) / totalHeap;
+
+    doc["maquina_id"] = maquina_id;
+    doc["operador"] = operador_id;
+    doc["ref_op"] = referencia;
+    doc["tempoTrabalho"] = tempoTrabalho;
+    doc["tempoProducao"] = tempoProducao;
+    doc["tempoBanheiro"] = tempoBanheiro;
+    doc["tempoManutencao"] = tempoManutencao;
+    doc["tempoFaltaMaterial"] = tempoFaltaMaterial;
+    doc["tempoQuebraAgulha"] = tempoQuebraAgulha;
+    doc["tempoTrocaPeca"] = tempoTrocaPeca;
+    doc["rpm"] = roundf(rpm * 100) / 100.0;
+    doc["cpuLoad"] = roundf(cpuLoad * 100) / 100.0;
+    doc["heapLoad"] = roundf(heapPorcentagemUsada * 100) / 100.0;
+
+
+    char jsonBuffer[512];
+    size_t len = serializeJson(doc, jsonBuffer);
+
+    Serial.println("JSON Gerado:");
+    Serial.println(jsonBuffer);
+
+    if (client.connected()) {
+      if (client.publish(mqtt_topic, jsonBuffer)) {
+        Serial.println("✅ JSON enviado com sucesso.");
+      } else {
+        Serial.println("❌ Falha ao enviar JSON.");
+      }
     } else {
-      Serial.print("Falha (rc=");
-      Serial.print(client.state());
-      Serial.println("), tentando em 5s");
-      delay(5000);
-      tentativas++;
+      Serial.println("⚠️ MQTT desconectado.");
     }
   }
-}
 
-void setup() {
-  Serial.begin(115200);
-  pinMode(ENCODER_PIN, INPUT_PULLUP);
-  attachInterrupt(digitalPinToInterrupt(ENCODER_PIN), countPulse, RISING);
+  void mostrarParadaNoLCD() {
+    lcd.setCursor(0, 2);
+    if (tempoBanheiro) lcd.print("Parada: Banheiro   ");
+    else if (tempoManutencao) lcd.print("Parada: Manutencao ");
+    else if (tempoFaltaMaterial) lcd.print("Parada: Falt. Mat. ");
+    else if (tempoQuebraAgulha) lcd.print("Parada: Q. Agulha  ");
+    else if (tempoTrocaPeca) lcd.print("Troca de Peca      ");
+    else lcd.print("                    ");
 
-  Wire.begin(21, 22);
-  lcd.init(); lcd.backlight();
-  lcd.setCursor(0, 0); 
-  lcd.print("Sistema Iniciado");
-  lcd.setCursor(0, 1); 
-  lcd.print("Efetue o Login!");
+    lcd.setCursor(0, 1);
+  if (tempoBanheiro || tempoManutencao || tempoFaltaMaterial || tempoQuebraAgulha || tempoTrocaPeca) {
+    lcd.print("Producao Pausada   ");
+  } else if (referencia != "") {
+    lcd.setCursor(0, 1);
+    lcd.print("                    ");
+    lcd.setCursor(0, 1);
+    lcd.print("REF: " + referencia);
+  } else {
+    lcd.print("Insira Referencia...");
+  }
+  }
 
-  SPI.begin();
-  rfid.PCD_Init();
-  conectarWiFi();
-  conectarMQTT();
-}
+  void conectarWiFi() {
+    WiFi.begin(ssid, password);
+    while (WiFi.status() != WL_CONNECTED) {
+      delay(500);
+      Serial.print(".");
+    }
+    Serial.println("\nWiFi conectado!");
+    Serial.println(WiFi.localIP());
+  }
 
-void loop() {
-  if (WiFi.status() != WL_CONNECTED) conectarWiFi();
-  if (!client.connected()) conectarMQTT();
-  client.loop();
+  void conectarMQTT() {
+    client.setServer(mqtt_server, mqtt_port);
+    int tentativas = 0;
+    while (!client.connected() && tentativas < 5) {
+      Serial.print("Conectando ao MQTT...");
+      if (client.connect(maquina_id)) {
+        Serial.println("Conectado ao MQTT!");
+        break;
+      } else {
+        Serial.print("Falha (rc=");
+        Serial.print(client.state());
+        Serial.println("), tentando em 5s");
+        delay(5000);
+        tentativas++;
+      }
+    }
+  }
 
-  verificarRFID();
-  verificarTeclado();
-  mostrarParadaNoLCD();
-
-  if (millis() - lastRPMCheck >= 1000) {
-    detachInterrupt(digitalPinToInterrupt(ENCODER_PIN));
-    rpm = (pulseCount * 60.0) / PULSES_PER_REV;
-    pulseCount = 0;
-    lastRPMCheck = millis();
+  void setup() {
+    Serial.begin(115200);
+    pinMode(ENCODER_PIN, INPUT_PULLUP);
     attachInterrupt(digitalPinToInterrupt(ENCODER_PIN), countPulse, RISING);
-    cpuLoad = getCPULoad();
-    lcd.setCursor(0, 3);
-    lcd.printf("RPM: %.2f    ", rpm);
+
+    Wire.begin(21, 22);
+    lcd.init(); lcd.backlight();
+    lcd.setCursor(0, 0); 
+    lcd.print("Sistema Iniciado");
+    lcd.setCursor(0, 1); 
+    lcd.print("Efetue o Login!");
+
+    SPI.begin();
+    rfid.PCD_Init();
+    conectarWiFi();
+    conectarMQTT();
   }
 
-  static unsigned long ultimaMensagem = 0;
-  if (millis() - ultimaMensagem >= 5000) {
-    enviarJSON();
-    ultimaMensagem = millis();
-  }
+  void loop() {
+    if (WiFi.status() != WL_CONNECTED) conectarWiFi();
+    if (!client.connected()) conectarMQTT();
+    client.loop();
 
-  vTaskDelay(pdMS_TO_TICKS(10));
-}
+    verificarRFID();
+    verificarTeclado();
+    mostrarParadaNoLCD();
+
+    if (millis() - lastRPMCheck >= 1000) {
+      detachInterrupt(digitalPinToInterrupt(ENCODER_PIN));
+      rpm = (pulseCount * 60.0) / PULSES_PER_REV;
+      pulseCount = 0;
+      lastRPMCheck = millis();
+      attachInterrupt(digitalPinToInterrupt(ENCODER_PIN), countPulse, RISING);
+      cpuLoad = getCPULoad();
+      lcd.setCursor(0, 3);
+      lcd.printf("RPM: %.2f    ", rpm);
+    }
+
+    static unsigned long ultimaMensagem = 0;
+    if (millis() - ultimaMensagem >= 5000) {
+      enviarJSON();
+      ultimaMensagem = millis();
+    }
+
+    vTaskDelay(pdMS_TO_TICKS(10));
+  }
