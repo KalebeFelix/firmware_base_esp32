@@ -28,7 +28,7 @@
   byte rowPins[ROWS] = {12, 33, 25, 27};
   byte colPins[COLS] = {14, 13, 26};
   Keypad keypad = Keypad(makeKeymap(keys), rowPins, colPins, ROWS, COLS);
-
+  
   const char* maquina_id = "MAQ01";
   const char* ssid = "SSID-REDE";
   const char* password = "SENHA-REDE";
@@ -234,55 +234,106 @@
     }
   }
 
-  void mostrarParadaNoLCD() {
-    lcd.setCursor(0, 2);
-    if (tempoBanheiro) lcd.print("Parada: Banheiro   ");
-    else if (tempoManutencao) lcd.print("Parada: Manutencao ");
-    else if (tempoFaltaMaterial) lcd.print("Parada: Falt. Mat. ");
-    else if (tempoQuebraAgulha) lcd.print("Parada: Q. Agulha  ");
-    else if (tempoTrocaPeca) lcd.print("Troca de Peca      ");
-    else lcd.print("                    ");
+ void mostrarParadaNoLCD() {
+  // Linha 2 – Mensagem de parada (sempre limpa antes)
+  lcd.setCursor(0, 2);
+  lcd.print("                    ");  // limpa toda a linha
+  lcd.setCursor(0, 2);
+  if (tempoBanheiro) lcd.print("Parada: Banheiro");
+  else if (tempoManutencao) lcd.print("Parada: Manutencao");
+  else if (tempoFaltaMaterial) lcd.print("Parada: Falt. Mat.");
+  else if (tempoQuebraAgulha) lcd.print("Parada: Q. Agulha ");
+  else if (tempoTrocaPeca) lcd.print("Troca de Peca     ");
 
-    lcd.setCursor(0, 1);
+  // Linha 1 – Situação da produção ou referência
+  lcd.setCursor(0, 1);
+  lcd.print("                    ");  // limpa toda a linha
+  lcd.setCursor(0, 1);
   if (tempoBanheiro || tempoManutencao || tempoFaltaMaterial || tempoQuebraAgulha || tempoTrocaPeca) {
-    lcd.print("Producao Pausada   ");
+    lcd.print("Producao Pausada!");
   } else if (referencia != "") {
-    lcd.setCursor(0, 1);
-    lcd.print("                    ");
-    lcd.setCursor(0, 1);
-    lcd.print("REF: " + referencia);
+    lcd.print("REF: " + referencia.substring(0, 16));  // evita ultrapassar limite
   } else {
-    lcd.print("Insira Referencia...");
+    lcd.print("Insira Referencia");
   }
-  }
+}
+
 
   void conectarWiFi() {
-    WiFi.begin(ssid, password);
-    while (WiFi.status() != WL_CONNECTED) {
-      delay(500);
-      Serial.print(".");
-    }
-    Serial.println("\nWiFi conectado!");
-    Serial.println(WiFi.localIP());
+  lcd.setCursor(0, 0);
+  lcd.print("Conectando WiFi...");
+  lcd.setCursor(0, 1);
+  lcd.print("                    ");
+  
+  WiFi.begin(ssid, password);
+  int tentativas = 0;
+  while (WiFi.status() != WL_CONNECTED && tentativas < 10) {
+    delay(500);
+    Serial.print(".");
+    tentativas++;
   }
 
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("\n✅ WiFi conectado!");
+    Serial.println(WiFi.localIP());
+
+    lcd.setCursor(0, 0);
+    lcd.print("WiFi conectado     ");
+    lcd.setCursor(0, 1);
+    lcd.print(WiFi.localIP().toString().substring(0, 20));
+    delay(2000);  // mostra IP por alguns segundos
+    lcd.setCursor(0, 0);
+    lcd.print("Sistema Iniciado   ");
+    lcd.setCursor(0, 1);
+    lcd.print("Efetue o Login!    ");
+  } else {
+    Serial.println("\n❌ Falha ao conectar WiFi.");
+    lcd.setCursor(0, 0);
+    lcd.print("Falha ao conectar  ");
+    lcd.setCursor(0, 1);
+    lcd.print("Rede WiFi.         ");
+  }
+}
+
+
   void conectarMQTT() {
-    client.setServer(mqtt_server, mqtt_port);
-    int tentativas = 0;
-    while (!client.connected() && tentativas < 5) {
-      Serial.print("Conectando ao MQTT...");
-      if (client.connect(maquina_id)) {
-        Serial.println("Conectado ao MQTT!");
-        break;
-      } else {
-        Serial.print("Falha (rc=");
-        Serial.print(client.state());
-        Serial.println("), tentando em 5s");
-        delay(5000);
-        tentativas++;
-      }
+  client.setServer(mqtt_server, mqtt_port);
+  int tentativas = 0;
+
+  lcd.setCursor(0, 0);
+  lcd.print("Conectando MQTT... ");
+  lcd.setCursor(0, 1);
+  lcd.print("                    ");
+
+  while (!client.connected() && tentativas < 5) {
+    Serial.print("Tentando MQTT... ");
+    if (client.connect(maquina_id)) {
+      Serial.println("✅ Conectado ao MQTT!");
+      lcd.setCursor(0, 0);
+      lcd.print("MQTT conectado     ");
+      delay(2000);  // mostra confirmação rápida
+      lcd.setCursor(0, 0);
+      lcd.print("Sistema Iniciado   ");
+      lcd.setCursor(0, 1);
+      lcd.print("Efetue o Login!    ");
+      return;
+    } else {
+      Serial.print("❌ Falha (rc=");
+      Serial.print(client.state());
+      Serial.println("), nova tentativa...");
+      delay(1000);
+      tentativas++;
     }
   }
+
+  // Falha após todas as tentativas
+  Serial.println("❌ Erro: não conectou ao MQTT!");
+  lcd.setCursor(0, 0);
+  lcd.print("Falha ao conectar  ");
+  lcd.setCursor(0, 1);
+  lcd.print("ao Broker MQTT     ");
+}
+
 
   void setup() {
     Serial.begin(115200);
@@ -303,8 +354,16 @@
   }
 
   void loop() {
-    if (WiFi.status() != WL_CONNECTED) conectarWiFi();
-    if (!client.connected()) conectarMQTT();
+    static bool wifiTentado = false;
+    if (WiFi.status() != WL_CONNECTED && !wifiTentado) {
+      conectarWiFi();
+      wifiTentado = true;  // não tenta mais depois de uma tentativa
+    }
+    static bool mqttTentado = false;
+    if (!client.connected() && WiFi.status() == WL_CONNECTED && !mqttTentado) {
+      conectarMQTT();
+      mqttTentado = true;  // evita novas tentativas automáticas
+    }
     client.loop();
 
     verificarRFID();
