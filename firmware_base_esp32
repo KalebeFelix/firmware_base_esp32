@@ -12,7 +12,7 @@
 
   #define RST_PIN 4
   #define SS_PIN 5
-  #define ENCODER_PIN 34
+  #define ENCODER_PIN 32
   #define PULSES_PER_REV 20
 
   LiquidCrystal_I2C lcd(0x27, 20, 4);
@@ -28,7 +28,7 @@
   byte rowPins[ROWS] = {12, 33, 25, 27};
   byte colPins[COLS] = {14, 13, 26};
   Keypad keypad = Keypad(makeKeymap(keys), rowPins, colPins, ROWS, COLS);
-  
+
   const char* maquina_id = "MAQ01";
   const char* ssid = "SSID-REDE";
   const char* password = "SENHA-REDE";
@@ -97,6 +97,13 @@
       lcd.print("Login: " + operador_id);
       lcd.setCursor(0, 1);
       lcd.print("REF: " + referencia);
+      lcd.setCursor(0, 2);
+      if (tempoBanheiro) lcd.print("Parada: Banheiro");
+      else if (tempoManutencao) lcd.print("Parada: Manutencao");
+      else if (tempoFaltaMaterial) lcd.print("Parada: Falt. Mat.");
+      else if (tempoQuebraAgulha) lcd.print("Parada: Q. Agulha ");
+      else if (tempoTrocaPeca) lcd.print("Troca de Peca     ");
+      else lcd.print("                    ");
     }
 
     rfid.PICC_HaltA();
@@ -169,7 +176,9 @@
 
             // Verifica se nenhuma outra parada está ativa
             if (!(tempoBanheiro || tempoManutencao || tempoFaltaMaterial || tempoQuebraAgulha || tempoTrocaPeca)) {
-              tempoProducao = true;  // Retoma produção automaticamente
+              if (referencia != "") {
+                tempoProducao = true;  // Só retoma se houver uma referência ativa
+              }
             }
           }
         }
@@ -234,29 +243,55 @@
     }
   }
 
- void mostrarParadaNoLCD() {
-  // Linha 2 – Mensagem de parada (sempre limpa antes)
-  lcd.setCursor(0, 2);
-  lcd.print("                    ");  // limpa toda a linha
-  lcd.setCursor(0, 2);
-  if (tempoBanheiro) lcd.print("Parada: Banheiro");
-  else if (tempoManutencao) lcd.print("Parada: Manutencao");
-  else if (tempoFaltaMaterial) lcd.print("Parada: Falt. Mat.");
-  else if (tempoQuebraAgulha) lcd.print("Parada: Q. Agulha ");
-  else if (tempoTrocaPeca) lcd.print("Troca de Peca     ");
+  void mostrarParadaNoLCD() {
+    static String ultimaLinha1 = "";
+    static String ultimaLinha2 = "";
 
-  // Linha 1 – Situação da produção ou referência
-  lcd.setCursor(0, 1);
-  lcd.print("                    ");  // limpa toda a linha
-  lcd.setCursor(0, 1);
-  if (tempoBanheiro || tempoManutencao || tempoFaltaMaterial || tempoQuebraAgulha || tempoTrocaPeca) {
-    lcd.print("Producao Pausada!");
-  } else if (referencia != "") {
-    lcd.print("REF: " + referencia.substring(0, 16));  // evita ultrapassar limite
-  } else {
-    lcd.print("Insira Referencia");
-  }
+    String novaLinha1 = "";
+    String novaLinha2 = "";
+
+    // Se operador não está logado, mostra mensagem para logar
+    if (operador_id == "") {
+      novaLinha1 = "Efetue o Login!";
+      novaLinha2 = "";
+    } else {
+      // Linha 2 – Mensagem de parada
+      if (tempoBanheiro) novaLinha2 = "Parada: Banheiro";
+      else if (tempoManutencao) novaLinha2 = "Parada: Manutencao";
+      else if (tempoFaltaMaterial) novaLinha2 = "Parada: Falt. Mat.";
+      else if (tempoQuebraAgulha) novaLinha2 = "Parada: Q. Agulha ";
+      else if (tempoTrocaPeca) novaLinha2 = "Troca de Peca     ";
+      else novaLinha2 = "";  // nenhuma parada ativa
+
+      // Linha 1 – Situação da produção ou referência
+      if (tempoBanheiro || tempoManutencao || tempoFaltaMaterial || tempoQuebraAgulha || tempoTrocaPeca) {
+        novaLinha1 = "Producao Pausada!";
+      } else if (referencia != "") {
+        novaLinha1 = "REF: " + referencia.substring(0, 16);
+      } else {
+        novaLinha1 = "Insira Referencia...";
+      }
+    }
+
+    // Atualiza apenas se o conteúdo mudou
+    if (novaLinha1 != ultimaLinha1) {
+      lcd.setCursor(0, 1);
+      lcd.print("                    ");
+      lcd.setCursor(0, 1);
+      lcd.print(novaLinha1);
+      ultimaLinha1 = novaLinha1;
+    }
+
+    if (novaLinha2 != ultimaLinha2) {
+      lcd.setCursor(0, 2);
+      lcd.print("                    ");
+      lcd.setCursor(0, 2);
+      lcd.print(novaLinha2);
+      ultimaLinha2 = novaLinha2;
+    }
 }
+
+
 
 
   void conectarWiFi() {
@@ -387,5 +422,5 @@
       ultimaMensagem = millis();
     }
 
-    vTaskDelay(pdMS_TO_TICKS(10));
+    vTaskDelay(pdMS_TO_TICKS(30));
   }
