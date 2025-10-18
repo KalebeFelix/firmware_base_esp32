@@ -9,14 +9,14 @@
   #include "esp_heap_caps.h"
   #include "freertos/FreeRTOS.h"
   #include "freertos/task.h"
-
+  
   #define RST_PIN 4
   #define SS_PIN 5
   #define ENCODER_PIN 32
-  #define PULSES_PER_REV 20
-
+  #define PULSES_PER_REV 1  // Um pulso por volta, ajuste se tiver mais marcas
+  
   LiquidCrystal_I2C lcd(0x27, 20, 4);
-
+  
   const byte ROWS = 4;
   const byte COLS = 3;
   char keys[ROWS][COLS] = {
@@ -25,39 +25,51 @@
     {'7','8','9'},
     {'*','0','#'}
   };
-  byte rowPins[ROWS] = {12, 33, 25, 27};
-  byte colPins[COLS] = {14, 13, 26};
+  byte rowPins[ROWS] = {12, 33, 16, 27};
+  byte colPins[COLS] = {14, 13, 17};
   Keypad keypad = Keypad(makeKeymap(keys), rowPins, colPins, ROWS, COLS);
-
+  
   const char* maquina_id = "MAQ01";
   const char* ssid = "SSID-REDE";
   const char* password = "SENHA-REDE";
   const char* mqtt_server = "IP-BROKER";
   const int mqtt_port = PORTA;
   const char* mqtt_topic = "esp32";
-
+  
   WiFiClient espClient;
   PubSubClient client(espClient);
   MFRC522 rfid(SS_PIN, RST_PIN);
-
+  
   String operador_id = "";
   String referencia = "";
   bool tempoTrabalho = false, tempoProducao = false;
   bool tempoBanheiro = false, tempoManutencao = false, tempoFaltaMaterial = false, tempoQuebraAgulha = false, tempoTrocaPeca = false;
-
+  
   volatile unsigned long pulseCount = 0;
+  volatile unsigned long lastPulseTime = 0;
   unsigned long lastRPMCheck = 0;
   float rpm = 0;
   float cpuLoad = 0.0f;
-
+  
+  // --- Variáveis para cálculo de RPM estável ---
+  #define RPM_SAMPLES 10
+  float rpmSamples[RPM_SAMPLES] = {0};
+  int sampleIndex = 0;
+  float rpmFiltrado = 0;              // Valor mostrado no LCD
+  const int LIMITE_VARIACAO = 30;     // Tolerância para aceitar mudança
+  
   void IRAM_ATTR countPulse() {
-    pulseCount++;
+    unsigned long now = millis();
+    if (now - lastPulseTime > 1) {  // debounce rápido
+      pulseCount++;
+      lastPulseTime = now;
+    }
   }
-
+  
   void resetarParadas() {
     tempoBanheiro = tempoManutencao = tempoFaltaMaterial = tempoQuebraAgulha = tempoTrocaPeca = false;
   }
-
+  
   void verificarRFID() {
     if (!rfid.PICC_IsNewCardPresent() || !rfid.PICC_ReadCardSerial()) return;
     String uid = "";
@@ -66,7 +78,7 @@
       uid += String(rfid.uid.uidByte[i], HEX);
     }
     uid.toUpperCase();
-
+  
     if (operador_id == "") {
       operador_id = uid;
       tempoTrabalho = true;
@@ -105,30 +117,29 @@
       else if (tempoTrocaPeca) lcd.print("Troca de Peca     ");
       else lcd.print("                    ");
     }
-
+  
     rfid.PICC_HaltA();
     rfid.PCD_StopCrypto1();
     delay(1000);
   }
-
+  
   void verificarTeclado() {
     if (operador_id == "") return;
-
+  
     static String buffer = "";
     static bool asteriscoPressionado = false;
-
+  
     char key = keypad.getKey();
     if (!key) return;
-
+  
     if (key == '*') {
       asteriscoPressionado = true;
-      buffer = "";  // limpa qualquer entrada anterior
+      buffer = "";  
       return;
     }
-
+  
     if (key == '#') {
       if (asteriscoPressionado) {
-        // Finaliza a referência
         referencia = "";
         tempoProducao = false;
         lcd.setCursor(0, 1);
@@ -140,7 +151,7 @@
         buffer = "";
         return;
       }
-
+  
       int valor = buffer.toInt();
       if (valor >= 15) {
         if (referencia == "") {
@@ -166,32 +177,27 @@
         else if (valor == 3) paradaAtual = &tempoFaltaMaterial;
         else if (valor == 4) paradaAtual = &tempoQuebraAgulha;
         else if (valor == 5) paradaAtual = &tempoTrocaPeca;
-
+  
         if (paradaAtual) {
           if (!(tempoBanheiro || tempoManutencao || tempoFaltaMaterial || tempoQuebraAgulha || tempoTrocaPeca)) {
             *paradaAtual = true;
-            tempoProducao = false;  // Pausar produção quando iniciar qualquer parada
+            tempoProducao = false;
           } else if (*paradaAtual) {
             *paradaAtual = false;
-
-            // Verifica se nenhuma outra parada está ativa
             if (!(tempoBanheiro || tempoManutencao || tempoFaltaMaterial || tempoQuebraAgulha || tempoTrocaPeca)) {
-              if (referencia != "") {
-                tempoProducao = true;  // Só retoma se houver uma referência ativa
-              }
+              if (referencia != "") tempoProducao = true;
             }
           }
         }
       }
-
+  
       buffer = "";
       asteriscoPressionado = false;
     } else {
       buffer += key;
     }
   }
-
-
+  
   float getCPULoad() {
     static unsigned long lastIdle = 0, lastTotal = 0;
     unsigned long idle = ulTaskGetIdleRunTimeCounter();
@@ -203,14 +209,13 @@
     if (totalDelta == 0) return 0.0;
     return (1.0 - ((float)idleDelta / totalDelta)) * 100.0;
   }
-
+  
   void enviarJSON() {
     StaticJsonDocument<512> doc;
     size_t totalHeap = heap_caps_get_total_size(MALLOC_CAP_DEFAULT);
     if (totalHeap == 0) totalHeap = 1;
-
     float heapPorcentagemUsada = ((totalHeap - esp_get_free_heap_size()) * 100.0) / totalHeap;
-
+  
     doc["maquina_id"] = maquina_id;
     doc["operador"] = operador_id;
     doc["ref_op"] = referencia;
@@ -221,49 +226,42 @@
     doc["tempoFaltaMaterial"] = tempoFaltaMaterial;
     doc["tempoQuebraAgulha"] = tempoQuebraAgulha;
     doc["tempoTrocaPeca"] = tempoTrocaPeca;
-    doc["rpm"] = roundf(rpm * 100) / 100.0;
+    doc["rpm"] = roundf(rpm * 100) / 100.0;  // mantém como estava
     doc["cpuLoad"] = roundf(cpuLoad * 100) / 100.0;
     doc["heapLoad"] = roundf(heapPorcentagemUsada * 100) / 100.0;
-
-
+  
     char jsonBuffer[512];
     size_t len = serializeJson(doc, jsonBuffer);
-
+  
     Serial.println("JSON Gerado:");
     Serial.println(jsonBuffer);
-
+  
     if (client.connected()) {
-      if (client.publish(mqtt_topic, jsonBuffer)) {
-        Serial.println("✅ JSON enviado com sucesso.");
-      } else {
-        Serial.println("❌ Falha ao enviar JSON.");
-      }
+      if (client.publish(mqtt_topic, jsonBuffer)) Serial.println("✅ JSON enviado com sucesso.");
+      else Serial.println("❌ Falha ao enviar JSON.");
     } else {
       Serial.println("⚠️ MQTT desconectado.");
     }
   }
-
+  
   void mostrarParadaNoLCD() {
     static String ultimaLinha1 = "";
     static String ultimaLinha2 = "";
-
+  
     String novaLinha1 = "";
     String novaLinha2 = "";
-
-    // Se operador não está logado, mostra mensagem para logar
+  
     if (operador_id == "") {
       novaLinha1 = "Efetue o Login!";
       novaLinha2 = "";
     } else {
-      // Linha 2 – Mensagem de parada
       if (tempoBanheiro) novaLinha2 = "Parada: Banheiro";
       else if (tempoManutencao) novaLinha2 = "Parada: Manutencao";
       else if (tempoFaltaMaterial) novaLinha2 = "Parada: Falt. Mat.";
       else if (tempoQuebraAgulha) novaLinha2 = "Parada: Q. Agulha ";
       else if (tempoTrocaPeca) novaLinha2 = "Troca de Peca     ";
-      else novaLinha2 = "";  // nenhuma parada ativa
-
-      // Linha 1 – Situação da produção ou referência
+      else novaLinha2 = "";
+  
       if (tempoBanheiro || tempoManutencao || tempoFaltaMaterial || tempoQuebraAgulha || tempoTrocaPeca) {
         novaLinha1 = "Producao Pausada!";
       } else if (referencia != "") {
@@ -272,8 +270,7 @@
         novaLinha1 = "Insira Referencia...";
       }
     }
-
-    // Atualiza apenas se o conteúdo mudou
+  
     if (novaLinha1 != ultimaLinha1) {
       lcd.setCursor(0, 1);
       lcd.print("                    ");
@@ -281,7 +278,7 @@
       lcd.print(novaLinha1);
       ultimaLinha1 = novaLinha1;
     }
-
+  
     if (novaLinha2 != ultimaLinha2) {
       lcd.setCursor(0, 2);
       lcd.print("                    ");
@@ -289,138 +286,161 @@
       lcd.print(novaLinha2);
       ultimaLinha2 = novaLinha2;
     }
-}
-
-
-
-
-  void conectarWiFi() {
-  lcd.setCursor(0, 0);
-  lcd.print("Conectando WiFi...");
-  lcd.setCursor(0, 1);
-  lcd.print("                    ");
+  }
   
-  WiFi.begin(ssid, password);
-  int tentativas = 0;
-  while (WiFi.status() != WL_CONNECTED && tentativas < 10) {
-    delay(500);
-    Serial.print(".");
-    tentativas++;
-  }
-
-  if (WiFi.status() == WL_CONNECTED) {
-    Serial.println("\n✅ WiFi conectado!");
-    Serial.println(WiFi.localIP());
-
+  void conectarWiFi() {
     lcd.setCursor(0, 0);
-    lcd.print("WiFi conectado     ");
+    lcd.print("Conectando WiFi...");
     lcd.setCursor(0, 1);
-    lcd.print(WiFi.localIP().toString().substring(0, 20));
-    delay(2000);  // mostra IP por alguns segundos
-    lcd.setCursor(0, 0);
-    lcd.print("Sistema Iniciado   ");
-    lcd.setCursor(0, 1);
-    lcd.print("Efetue o Login!    ");
-  } else {
-    Serial.println("\n❌ Falha ao conectar WiFi.");
-    lcd.setCursor(0, 0);
-    lcd.print("Falha ao conectar  ");
-    lcd.setCursor(0, 1);
-    lcd.print("Rede WiFi.         ");
-  }
-}
-
-
-  void conectarMQTT() {
-  client.setServer(mqtt_server, mqtt_port);
-  int tentativas = 0;
-
-  lcd.setCursor(0, 0);
-  lcd.print("Conectando MQTT... ");
-  lcd.setCursor(0, 1);
-  lcd.print("                    ");
-
-  while (!client.connected() && tentativas < 5) {
-    Serial.print("Tentando MQTT... ");
-    if (client.connect(maquina_id)) {
-      Serial.println("✅ Conectado ao MQTT!");
+    lcd.print("                    ");
+    
+    WiFi.begin(ssid, password);
+    int tentativas = 0;
+    while (WiFi.status() != WL_CONNECTED && tentativas < 10) {
+      delay(500);
+      Serial.print(".");
+      tentativas++;
+    }
+  
+    if (WiFi.status() == WL_CONNECTED) {
+      Serial.println("\n✅ WiFi conectado!");
+      Serial.println(WiFi.localIP());
+  
       lcd.setCursor(0, 0);
-      lcd.print("MQTT conectado     ");
-      delay(2000);  // mostra confirmação rápida
+      lcd.print("WiFi conectado     ");
+      lcd.setCursor(0, 1);
+      lcd.print(WiFi.localIP().toString().substring(0, 20));
+      delay(2000);
       lcd.setCursor(0, 0);
       lcd.print("Sistema Iniciado   ");
       lcd.setCursor(0, 1);
       lcd.print("Efetue o Login!    ");
-      return;
     } else {
-      Serial.print("❌ Falha (rc=");
-      Serial.print(client.state());
-      Serial.println("), nova tentativa...");
-      delay(1000);
-      tentativas++;
+      Serial.println("\n❌ Falha ao conectar WiFi.");
+      lcd.setCursor(0, 0);
+      lcd.print("Falha ao conectar  ");
+      lcd.setCursor(0, 1);
+      lcd.print("Rede WiFi.         ");
     }
   }
-
-  // Falha após todas as tentativas
-  Serial.println("❌ Erro: não conectou ao MQTT!");
-  lcd.setCursor(0, 0);
-  lcd.print("Falha ao conectar  ");
-  lcd.setCursor(0, 1);
-  lcd.print("ao Broker MQTT     ");
-}
-
-
+  
+  void conectarMQTT() {
+    client.setServer(mqtt_server, mqtt_port);
+    int tentativas = 0;
+    lcd.setCursor(0, 0);
+    lcd.print("Conectando MQTT... ");
+    lcd.setCursor(0, 1);
+    lcd.print("                    ");
+  
+    while (!client.connected() && tentativas < 5) {
+      Serial.print("Tentando MQTT... ");
+      if (client.connect(maquina_id)) {
+        Serial.println("✅ Conectado ao MQTT!");
+        lcd.setCursor(0, 0);
+        lcd.print("MQTT conectado     ");
+        delay(2000);
+        lcd.setCursor(0, 0);
+        lcd.print("Sistema Iniciado   ");
+        lcd.setCursor(0, 1);
+        lcd.print("Efetue o Login!    ");
+        return;
+      } else {
+        Serial.print("❌ Falha (rc=");
+        Serial.print(client.state());
+        Serial.println("), nova tentativa...");
+        delay(1000);
+        tentativas++;
+      }
+    }
+  
+    Serial.println("❌ Erro: não conectou ao MQTT!");
+    lcd.setCursor(0, 0);
+    lcd.print("Falha ao conectar  ");
+    lcd.setCursor(0, 1);
+    lcd.print("ao Broker MQTT     ");
+  }
+  
   void setup() {
     Serial.begin(115200);
-    pinMode(ENCODER_PIN, INPUT_PULLUP);
-    attachInterrupt(digitalPinToInterrupt(ENCODER_PIN), countPulse, RISING);
-
+    pinMode(ENCODER_PIN, INPUT);
+    attachInterrupt(digitalPinToInterrupt(ENCODER_PIN), countPulse, FALLING);
+  
     Wire.begin(21, 22);
-    lcd.init(); lcd.backlight();
-    lcd.setCursor(0, 0); 
+    lcd.init();
+    lcd.backlight();
+    lcd.setCursor(0, 0);
     lcd.print("Sistema Iniciado");
-    lcd.setCursor(0, 1); 
+    lcd.setCursor(0, 1);
     lcd.print("Efetue o Login!");
-
+  
     SPI.begin();
     rfid.PCD_Init();
+  
     conectarWiFi();
     conectarMQTT();
   }
-
+  
   void loop() {
     static bool wifiTentado = false;
     if (WiFi.status() != WL_CONNECTED && !wifiTentado) {
       conectarWiFi();
-      wifiTentado = true;  // não tenta mais depois de uma tentativa
+      wifiTentado = true;
     }
+  
     static bool mqttTentado = false;
     if (!client.connected() && WiFi.status() == WL_CONNECTED && !mqttTentado) {
       conectarMQTT();
-      mqttTentado = true;  // evita novas tentativas automáticas
+      mqttTentado = false; // mantém tentando na próxima iteração
     }
+  
     client.loop();
-
     verificarRFID();
     verificarTeclado();
     mostrarParadaNoLCD();
-
+  
+    // --- RPM calculado de forma estável ---
     if (millis() - lastRPMCheck >= 1000) {
       detachInterrupt(digitalPinToInterrupt(ENCODER_PIN));
-      rpm = (pulseCount * 60.0) / PULSES_PER_REV;
-      pulseCount = 0;
+  
+      // Se não houve pulso nos últimos 2 segundos, zera RPM
+      if (millis() - lastPulseTime > 2000) {
+        pulseCount = 0;
+        rpm = 0;
+        rpmFiltrado = 0;
+        for (int i = 0; i < RPM_SAMPLES; i++) rpmSamples[i] = 0;
+      } else {
+        float rpmInstant = (pulseCount * 60.0) / PULSES_PER_REV;
+        pulseCount = 0;
+  
+        // Média móvel
+        rpmSamples[sampleIndex] = rpmInstant;
+        sampleIndex = (sampleIndex + 1) % RPM_SAMPLES;
+  
+        float soma = 0;
+        for (int i = 0; i < RPM_SAMPLES; i++) soma += rpmSamples[i];
+        rpm = soma / RPM_SAMPLES;
+  
+        // --- Filtro de histerese para exibir no LCD ---
+        if (abs(rpm - rpmFiltrado) > LIMITE_VARIACAO) {
+          rpmFiltrado = rpm;
+        }
+      }
+  
       lastRPMCheck = millis();
-      attachInterrupt(digitalPinToInterrupt(ENCODER_PIN), countPulse, RISING);
+      attachInterrupt(digitalPinToInterrupt(ENCODER_PIN), countPulse, FALLING);
+  
       cpuLoad = getCPULoad();
+  
       lcd.setCursor(0, 3);
-      lcd.printf("RPM: %.2f    ", rpm);
+      lcd.printf("RPM: %.0f    ", rpmFiltrado);
     }
-
+  
+    // Envio JSON a cada 5s
     static unsigned long ultimaMensagem = 0;
     if (millis() - ultimaMensagem >= 5000) {
       enviarJSON();
       ultimaMensagem = millis();
     }
-
+  
     vTaskDelay(pdMS_TO_TICKS(30));
   }
