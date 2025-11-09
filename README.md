@@ -5,7 +5,8 @@ Este projeto implementa um firmware completo para ESP32, voltado ao monitorament
 ## 🚀 Funcionalidades Principais
 
 - 📲 **Login por RFID**: operadores se identificam ao aproximar seu cartão RFID.
-- ⌨️ **Controle por Teclado**: permite inserir códigos de referência de produção e registrar paradas.
+- 🏷️ **Referência por RFID**: operadores se identificam ao aproximar seu cartão RFID.
+- ⌨️ **Controle por Teclado**: sistema dinâmico para registrar paradas de produção.
 - 📉 **Cálculo de RPM**: utiliza um sensor de pulso (encoder) conectado à máquina.
 - 🧠 **Medição de uso da CPU e RAM** do ESP32.
 - 📡 **Envio de dados para broker MQTT** em tempo real, a cada 5 segundos.
@@ -20,7 +21,7 @@ Este projeto implementa um firmware completo para ESP32, voltado ao monitorament
 - Display LCD I2C 20x4
 - Keypad matricial 4x3
 - Sensor de pulso (encoder óptico ou magnético)
-- Broker MQTT (ex: Mosquitto)
+- Broker MQTT (Mosquitto)
 - Conexão Wi-Fi
 
 ---
@@ -28,31 +29,38 @@ Este projeto implementa um firmware completo para ESP32, voltado ao monitorament
 ## 🧩 Lógica de Funcionamento
 
 ### ✅ 1. Login e Logout via RFID
-- Quando **nenhum operador está logado**, ao passar um cartão RFID válido, o sistema realiza o **login**.
+- 🔐 Login do Operador
+  - Primeiro RFID: registra como operador
   - Ativa `tempoTrabalho = true`
   - Exibe mensagem `"Login: <UID>"` e `"Insira Referencia..."`
 
-- Se o mesmo operador passar o cartão novamente, realiza o **logout**:
-  - Zera operador, referência, produção e paradas.
-  - Exibe `"Logout Realizado"` e `"Efetue o Login!"`
+- 🏷️ Definição de Referência
+  - Segundo RFID: registra como referência de produção
+  - Ativa `tempoProducao = true`
+  - Exibe `"Login: [UID]"` e `"REF: [UID]"`
 
-- Se outro operador tentar logar enquanto já há um ativo, a tentativa é rejeitada.
-
+- 🔓 Logout Inteligente
+  - Mesmo RFID do operador: logout completo
+     - Limpa operador, referência e paradas
+     - Volta ao estado inicial
+  - Mesmo RFID da referência: finaliza apenas a referência
+     - Mantém operador logado
+     - Exibe mensagem `"REF finalizada"` e `"Insira Referencia..."`
+       
+- ⚠️ Validações
+    - Tentativa de usar terceiro RFID com referência ativa é rejeitada
+    - Mensagem: `"REF ja ativa! Use mesmo REF p/sair"` 
+  
 ---
 
-### 🔢 2. Inserção de Referência e Paradas (via Teclado)
+### 🔢 2. Sistema Dinâmico de Paradas via Teclado
 
-- Após login, o operador pode digitar **um número no teclado e pressionar `#`**.
-- O valor digitado determina a ação:
+#### 🎯 Como Funciona
+ - Pressione `*`: ativa modo parada → "Insira parada..."
+ - Digite código (1-5): `"Insira parada: X"`
+ - Pressione `#`: confirma parada → `"Parada: [Nome]"`
+ - Pressione `*` novamente: desativa parada → linha fica vazia
 
-#### ℹ️ Referência de Produção
-- **Se o número for `15` ou maior**, é considerado uma **referência válida**:
-  - Se nenhuma referência ativa, ativa `tempoProducao = true`
-  - Exibe `"REF: <referencia>"`
-- Se já houver uma referência ativa, ignora e exibe `"REF já ativa!"`.
-
-#### ⛔ Paradas de Produção
-- **Se o número for de `1` a `5`**, ativa/desativa os tipos de parada:
   | Código | Parada             |
   |--------|--------------------|
   | 1      | Banheiro           |
@@ -64,11 +72,12 @@ Este projeto implementa um firmware completo para ESP32, voltado ao monitorament
 - Somente uma parada pode estar ativa por vez.
 - Ao ser ativado qualquer tipo de parada, o tempo produção vira false.
 
-#### 🔄 Finalizar Referência
-- Para **finalizar a produção atual**:
-  - Pressione `*` e depois `#`
-  - Isso **limpa a referência** e desativa `tempoProducao`
-  - Exibe `"REF finalizada"`
+#### 🔄 Comportamento das Paradas
+ - Ativação: pausa produção (`tempoProducao = false`)
+
+ - Desativação: retoma produção (`tempoProducao = true`)
+
+ - Uma parada por vez: sistema impede múltiplas paradas simultâneas
 
 ---
 
@@ -83,7 +92,7 @@ RPM = (pulsos * 60) / PULSES_PER_REV
 ---
 
 ### 📊 4. Monitoramento de Sistema
-- A cada 5 segundos, o sistema envia um JSON via MQTT com os seguintes dados:
+- A cada 3 segundos, o sistema envia um JSON via MQTT com os seguintes dados:
 
 ```json
 {
