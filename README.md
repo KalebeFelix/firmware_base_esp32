@@ -5,7 +5,7 @@ Este projeto implementa um firmware completo para ESP32, voltado ao monitorament
 ## 🚀 Funcionalidades Principais
 
 - 📲 **Login por RFID**: operadores se identificam ao aproximar seu cartão RFID.
-- 🏷️ **Referência por RFID**: operadores se identificam ao aproximar seu cartão RFID.
+- 🏷️ **Referência por RFID**: segunda leitura de RFID define a referência de produção..
 - ⌨️ **Controle por Teclado**: sistema dinâmico para registrar paradas de produção.
 - 📉 **Cálculo de RPM**: utiliza um sensor de pulso (encoder) conectado à máquina.
 - 🧠 **Medição de uso da CPU e RAM** do ESP32.
@@ -85,9 +85,8 @@ Este projeto implementa um firmware completo para ESP32, voltado ao monitorament
 - Um **sensor de pulso (encoder)** gera interrupções no pino `ENCODER_PIN`.
 - A cada segundo, o sistema calcula:
   
-RPM = (pulsos * 60) / PULSES_PER_REV
+RPM = (pulsos * 60) 
 - Mostra o valor no LCD: `RPM: xx.xx`
-- Será utilizado para saber o tempo de maquina. 
 
 ---
 
@@ -96,17 +95,17 @@ RPM = (pulsos * 60) / PULSES_PER_REV
 
 ```json
 {
-"maquina_id": "MAQ01",
-"operador": "UID_RFID",
-"ref_op": "123",
-"tempoTrabalho": true,
-"tempoProducao": true,
-"tempoBanheiro": false,
-"tempoManutencao": false,
-"tempoFaltaMaterial": false,
-"tempoQuebraAgulha": false,
-"tempoTrocaPeca": false,
-"rpm": 240.00,
-"cpuLoad": 52.5,
-"heapLoad": 34.7
+  "maquina_id": "MAQ01",
+  "operador": "UID_RFID_OPERADOR",
+  "ref_op": "UID_RFID_REFERENCIA",
+  "tempoTrabalho": true,
+  "tempoProducao": true,
+  "Banheiro": false,
+  "Manutencao": false,
+  "FaltaMaterial": false,
+  "QuebraAgulha": false,
+  "TrocaPeca": false,
+  "rpm": 240.00,
+  "cpuLoad": 52.5,
+  "heapLoad": 34.7
 }
