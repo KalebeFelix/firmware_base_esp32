@@ -88,6 +88,8 @@ Este projeto implementa um firmware completo para ESP32, voltado ao monitorament
 RPM = (pulsos * 60) 
 - Mostra o valor no LCD: `RPM: xx.xx`
 
+- Sera enviado um array representando os RPM medidos individualmente a cada segundo dentro do ciclo de 3 segundos.
+
 ---
 
 ### 📊 4. Monitoramento de Sistema
@@ -105,7 +107,7 @@ RPM = (pulsos * 60)
   "FaltaMaterial": false,
   "QuebraAgulha": false,
   "TrocaPeca": false,
-  "rpm": 240.00,
+  "rpm": [240, 360, 60],
   "cpuLoad": 52.5,
   "heapLoad": 34.7
 }
