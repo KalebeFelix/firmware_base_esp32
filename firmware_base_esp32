@@ -528,3 +528,7 @@ void loop() {
 
   vTaskDelay(pdMS_TO_TICKS(20));
 }
+
+/* 
+  Sistema desenvolvido por: Kalebe e João Victor
+*/
