@@ -13,7 +13,6 @@
 #define RST_PIN 4
 #define SS_PIN 5
 #define ENCODER_PIN 32
-#define PULSES_PER_REV 1  // Um pulso por volta, ajuste se tiver mais marcas
 
 LiquidCrystal_I2C lcd(0x27, 20, 4);
 
@@ -83,6 +82,8 @@ volatile unsigned long pulseCount = 0;
 volatile unsigned long lastPulseTime = 0;
 unsigned long lastRPMCheck = 0;
 float rpm = 0;
+float rpmBuffer[3] = {0, 0, 0};
+int rpmIndex = 0;
 float cpuLoad = 0.0f;
 
 void IRAM_ATTR countPulse() {
@@ -127,7 +128,7 @@ void verificarRFID() {
     Serial.println("✅ Operador logado: " + operador_id);
   }
   // Se há operador logado mas não há referência, este é o ref_op
-  else if (referencia == "") {
+  else if (referencia == "" && uid != operador_id) {
     referencia = uid;
     referencia_uid = uid;
     tempoProducao = true;
@@ -327,7 +328,11 @@ void enviarJSON() {
     doc[paradas[i].nome] = *paradas[i].flag;
   }
   
-  doc["rpm"] = roundf(rpm * 100) / 100.0;
+  JsonArray rpmArray = doc.createNestedArray("rpm");
+  rpmArray.add(rpmBuffer[0]);
+  rpmArray.add(rpmBuffer[1]);
+  rpmArray.add(rpmBuffer[2]);
+  
   doc["cpuLoad"] = roundf(cpuLoad * 100) / 100.0;
   doc["heapLoad"] = roundf(heapPorcentagemUsada * 100) / 100.0;
 
@@ -507,6 +512,10 @@ void loop() {
     pulseCount = 0;
     lastRPMCheck = millis();
     attachInterrupt(digitalPinToInterrupt(ENCODER_PIN), countPulse, FALLING);
+
+    rpmBuffer[rpmIndex] = rpm;
+    rpmIndex = (rpmIndex + 1) % 3;
+
     cpuLoad = getCPULoad();
   }
 
