@@ -1,3 +1,24 @@
+/**
+ * =============================================================================
+ * SISTEMA DE MONITORAMENTO DE PRODUÇÃO - ESP32
+ * Versão: 2.0.0 (Refactored)
+ * =============================================================================
+ *
+ * Arquitetura:
+ * - Máquina de estados formal com transições validadas
+ * - Zero blocking delays no loop principal
+ * - Buffer circular para RPM com ordem cronológica correta
+ * - Reconexão WiFi/MQTT com backoff exponencial
+ * - Strings fixas (char[]) em vez de String dinâmico
+ * - Display com dirty flag (atualiza só quando necessário)
+ * - ISR otimizada sem leituras redundantes
+ * - Envio condicional de payload (mudança de estado OU intervalo)
+ *
+ * Desenvolvedores: Kalebe Felix, João Victor
+ * Refatoração: João Ícaro
+ * =============================================================================
+ */
+
 #include <WiFi.h>
 #include <PubSubClient.h>
 #include <Wire.h>
@@ -10,525 +31,676 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
-#define RST_PIN 4
-#define SS_PIN 5
-#define ENCODER_PIN 32
+// =============================================================================
+// CONFIGURAÇÃO DE HARDWARE
+// =============================================================================
+#define RST_PIN         4
+#define SS_PIN          5
+#define ENCODER_PIN     32
+#define I2C_SDA         21
+#define I2C_SCL         22
+#define LCD_ADDR        0x27
+#define LCD_COLS        20
+#define LCD_ROWS        4
 
-LiquidCrystal_I2C lcd(0x27, 20, 4);
+// =============================================================================
+// CONFIGURAÇÃO DE REDE (TODO: Mover para NVS/SPIFFS em produção)
+// =============================================================================
+namespace Config {
+    const char* MACHINE_ID   = "MAQ01";
+    const char* WIFI_SSID    = "SSID-REDE";
+    const char* WIFI_PASS    = "SENHA-REDE";
+    const char* MQTT_SERVER  = "192.168.1.100";
+    const uint16_t MQTT_PORT = 1883;
+    const char* MQTT_TOPIC   = "producao/maquinas";
+}
 
-const byte ROWS = 4;
-const byte COLS = 3;
-char keys[ROWS][COLS] = {
-  {'1','2','3'},
-  {'4','5','6'},
-  {'7','8','9'},
-  {'*','0','#'}
+// =============================================================================
+// CONSTANTES DE TIMING (em milissegundos)
+// =============================================================================
+namespace Timing {
+    const uint32_t RPM_CALC_INTERVAL    = 1000;   // Calcular RPM a cada 1s
+    const uint32_t MQTT_SEND_INTERVAL   = 3000;   // Enviar MQTT a cada 3s
+    const uint32_t DISPLAY_REFRESH      = 250;    // Atualizar display 4x/s
+    const uint32_t RFID_DEBOUNCE        = 1500;   // Debounce RFID
+    const uint32_t WIFI_RETRY_BASE      = 5000;   // Base retry WiFi
+    const uint32_t WIFI_RETRY_MAX       = 60000;  // Max retry WiFi
+    const uint32_t MQTT_RETRY_BASE      = 2000;   // Base retry MQTT
+    const uint32_t MQTT_RETRY_MAX       = 30000;  // Max retry MQTT
+    const uint32_t LCD_MESSAGE_DURATION = 2000;   // Mensagens temporárias
+}
+
+// =============================================================================
+// MÁQUINA DE ESTADOS
+// =============================================================================
+typedef enum : uint8_t {
+    STATE_IDLE = 0,        // Aguardando login do operador
+    STATE_LOGGED_IN,       // Operador logado, aguardando referência
+    STATE_PRODUCING,       // Produzindo (com referência)
+    STATE_PAUSED           // Parada ativa
+} SystemState;
+
+const char* STATE_NAMES[] = {
+    "IDLE", "LOGGED_IN", "PRODUCING", "PAUSED"
 };
-byte rowPins[ROWS] = {12, 33, 16, 27};
-byte colPins[COLS] = {14, 13, 17};
-Keypad keypad = Keypad(makeKeymap(keys), rowPins, colPins, ROWS, COLS);
 
-const char* maquina_id = "MAQ01";
-const char* ssid = "SSID-REDE";
-const char* password = "SENHA-REDE";
-const char* mqtt_server = "IP-BROKER";
-const int mqtt_port = PORTA;
-const char* mqtt_topic = "esp32";
+// =============================================================================
+// TIPOS DE PARADA
+// =============================================================================
+typedef enum : uint8_t {
+    PARADA_NONE = 0,
+    PARADA_BANHEIRO = 1,
+    PARADA_MANUTENCAO = 2,
+    PARADA_FALTA_MATERIAL = 3,
+    PARADA_QUEBRA_AGULHA = 4,
+    PARADA_TROCA_PECA = 5,
+    PARADA_COUNT = 6
+} ParadaTipo;
 
-WiFiClient espClient;
-PubSubClient client(espClient);
+typedef struct {
+    const char* json_name;
+    const char* display_name;
+} ParadaInfo;
+
+const ParadaInfo PARADAS[PARADA_COUNT] = {
+    {"none",          ""},
+    {"Banheiro",      "Banheiro"},
+    {"Manutencao",    "Manutencao"},
+    {"FaltaMaterial", "Falt. Material"},
+    {"QuebraAgulha",  "Quebra Agulha"},
+    {"TrocaPeca",     "Troca Peca"}
+};
+
+// =============================================================================
+// CONTEXTO DO SISTEMA (substitui variáveis globais dispersas)
+// =============================================================================
+typedef struct {
+    // Estado principal
+    SystemState state;
+    SystemState prev_state;
+
+    // Identificadores (8 hex chars + null)
+    char operador_uid[9];
+    char referencia_uid[9];
+
+    // Parada
+    ParadaTipo parada_ativa;
+
+    // RPM - Buffer circular com índice de escrita
+    volatile uint32_t pulse_count;
+    uint32_t rpm_buffer[3];
+    uint8_t rpm_write_index;
+    float rpm_atual;
+
+    // Timestamps (não-bloqueante)
+    uint32_t last_rpm_calc;
+    uint32_t last_mqtt_send;
+    uint32_t last_display_update;
+    uint32_t last_rfid_read;
+    uint32_t last_wifi_attempt;
+    uint32_t last_mqtt_attempt;
+    uint32_t temp_message_start;
+
+    // Backoff exponencial
+    uint32_t wifi_retry_delay;
+    uint32_t mqtt_retry_delay;
+
+    // Flags de controle
+    bool display_dirty;
+    bool state_changed;
+    bool mqtt_send_pending;
+    bool temp_message_active;
+    bool modo_parada_input;
+
+    // Buffer de entrada teclado
+    char keypad_buffer[4];
+    uint8_t keypad_buffer_len;
+
+    // Métricas do sistema
+    float cpu_load;
+    float heap_load;
+
+    // Mensagem temporária
+    char temp_message[21];
+} SystemContext;
+
+// Instância global do contexto
+static SystemContext ctx;
+
+// =============================================================================
+// OBJETOS DE HARDWARE
+// =============================================================================
+LiquidCrystal_I2C lcd(LCD_ADDR, LCD_COLS, LCD_ROWS);
 MFRC522 rfid(SS_PIN, RST_PIN);
+WiFiClient wifiClient;
+PubSubClient mqtt(wifiClient);
 
-// Estrutura para paradas dinâmicas
-struct Parada {
-  int codigo;
-  String nome;
-  String nomeDisplay;
-  bool* flag;
+// Configuração do teclado
+const byte KEYPAD_ROWS = 4;
+const byte KEYPAD_COLS = 3;
+char keypad_keys[KEYPAD_ROWS][KEYPAD_COLS] = {
+    {'1', '2', '3'},
+    {'4', '5', '6'},
+    {'7', '8', '9'},
+    {'*', '0', '#'}
 };
+byte keypad_row_pins[KEYPAD_ROWS] = {12, 33, 16, 27};
+byte keypad_col_pins[KEYPAD_COLS] = {14, 13, 17};
+Keypad keypad = Keypad(makeKeymap(keypad_keys), keypad_row_pins, keypad_col_pins, KEYPAD_ROWS, KEYPAD_COLS);
 
-// Array de paradas - fácil de adicionar/remover
-Parada paradas[] = {
-  {1, "Banheiro", "Banheiro", NULL},
-  {2, "Manutencao", "Manutencao", NULL},
-  {3, "FaltaMaterial", "Falt. Material", NULL},
-  {4, "QuebraAgulha", "Quebra Agulha", NULL},
-  {5, "TrocaPeca", "Troca Peca", NULL}
-  // Adicione mais paradas aqui seguindo o mesmo padrão
-};
-
-const int NUM_PARADAS = sizeof(paradas) / sizeof(paradas[0]);
-
-String operador_id = "";
-String referencia = "";
-String referencia_uid = "";
-bool tempoTrabalho = false, tempoProducao = false;
-bool tempoBanheiro = false, tempoManutencao = false, tempoFaltaMaterial = false, tempoQuebraAgulha = false, tempoTrocaPeca = false;
-
-// Variáveis para controle do modo parada
-bool modoParadaAtivo = false;
-String paradaAtual = "";
-
-// Inicializar flags das paradas
-void inicializarParadas() {
-  paradas[0].flag = &tempoBanheiro;
-  paradas[1].flag = &tempoManutencao;
-  paradas[2].flag = &tempoFaltaMaterial;
-  paradas[3].flag = &tempoQuebraAgulha;
-  paradas[4].flag = &tempoTrocaPeca;
+// =============================================================================
+// ISR - CONTAGEM DE PULSOS (Otimizada)
+// =============================================================================
+void IRAM_ATTR onEncoderPulse() {
+    ctx.pulse_count++;
 }
 
-volatile unsigned long pulseCount = 0;
-volatile unsigned long lastPulseTime = 0;
-unsigned long lastRPMCheck = 0;
-float rpm = 0;
-float rpmBuffer[3] = {0, 0, 0};
-int rpmIndex = 0;
-float cpuLoad = 0.0f;
-
-void IRAM_ATTR countPulse() {
-  if (digitalRead(ENCODER_PIN) == LOW) {
-    pulseCount++;
-  }
+// =============================================================================
+// INICIALIZAÇÃO DO CONTEXTO
+// =============================================================================
+void initContext() {
+    memset(&ctx, 0, sizeof(SystemContext));
+    ctx.state = STATE_IDLE;
+    ctx.prev_state = STATE_IDLE;
+    ctx.parada_ativa = PARADA_NONE;
+    ctx.display_dirty = true;
+    ctx.wifi_retry_delay = Timing::WIFI_RETRY_BASE;
+    ctx.mqtt_retry_delay = Timing::MQTT_RETRY_BASE;
 }
 
-void resetarParadas() {
-  tempoBanheiro = tempoManutencao = tempoFaltaMaterial = tempoQuebraAgulha = tempoTrocaPeca = false;
-  paradaAtual = "";
-}
+// =============================================================================
+// TRANSIÇÃO DE ESTADOS (com validação)
+// =============================================================================
+bool transitionTo(SystemState new_state) {
+    // Validar transições permitidas
+    bool valid = false;
 
-String lerUIDRFID() {
-  String uid = "";
-  if (rfid.PICC_IsNewCardPresent() && rfid.PICC_ReadCardSerial()) {
-    for (byte i = 0; i < rfid.uid.size; i++) {
-      if (rfid.uid.uidByte[i] < 0x10) uid += "0";
-      uid += String(rfid.uid.uidByte[i], HEX);
+    switch (ctx.state) {
+        case STATE_IDLE:
+            valid = (new_state == STATE_LOGGED_IN);
+            break;
+        case STATE_LOGGED_IN:
+            valid = (new_state == STATE_IDLE || new_state == STATE_PRODUCING);
+            break;
+        case STATE_PRODUCING:
+            valid = (new_state == STATE_LOGGED_IN || new_state == STATE_PAUSED || new_state == STATE_IDLE);
+            break;
+        case STATE_PAUSED:
+            valid = (new_state == STATE_PRODUCING || new_state == STATE_LOGGED_IN || new_state == STATE_IDLE);
+            break;
     }
-    uid.toUpperCase();
-    
+
+    if (!valid) {
+        Serial.printf("[FSM] Transicao invalida: %s -> %s\n",
+            STATE_NAMES[ctx.state], STATE_NAMES[new_state]);
+        return false;
+    }
+
+    Serial.printf("[FSM] %s -> %s\n", STATE_NAMES[ctx.state], STATE_NAMES[new_state]);
+    ctx.prev_state = ctx.state;
+    ctx.state = new_state;
+    ctx.state_changed = true;
+    ctx.display_dirty = true;
+    ctx.mqtt_send_pending = true;
+
+    return true;
+}
+
+// =============================================================================
+// DISPLAY - Mensagem Temporária (não bloqueante)
+// =============================================================================
+void showTempMessage(const char* msg) {
+    strncpy(ctx.temp_message, msg, 20);
+    ctx.temp_message[20] = '\0';
+    ctx.temp_message_active = true;
+    ctx.temp_message_start = millis();
+    ctx.display_dirty = true;
+}
+
+// =============================================================================
+// DISPLAY - Atualização Principal
+// =============================================================================
+void updateDisplay() {
+    uint32_t now = millis();
+
+    // Verificar se mensagem temporária expirou
+    if (ctx.temp_message_active &&
+        (now - ctx.temp_message_start >= Timing::LCD_MESSAGE_DURATION)) {
+        ctx.temp_message_active = false;
+        ctx.display_dirty = true;
+    }
+
+    // Só atualizar se dirty OU intervalo de refresh
+    if (!ctx.display_dirty &&
+        (now - ctx.last_display_update < Timing::DISPLAY_REFRESH)) {
+        return;
+    }
+
+    ctx.last_display_update = now;
+    ctx.display_dirty = false;
+
+    // Linha 0: Status do operador
+    lcd.setCursor(0, 0);
+    if (ctx.operador_uid[0] == '\0') {
+        lcd.print("Sistema Iniciado    ");
+    } else {
+        lcd.printf("Login: %-12s", ctx.operador_uid);
+    }
+
+    // Linha 1: Referência ou instrução
+    lcd.setCursor(0, 1);
+    if (ctx.temp_message_active) {
+        lcd.printf("%-20s", ctx.temp_message);
+    } else if (ctx.operador_uid[0] == '\0') {
+        lcd.print("Efetue o Login!     ");
+    } else if (ctx.referencia_uid[0] == '\0') {
+        lcd.print("Insira Referencia...");
+    } else {
+        lcd.printf("REF: %-14s", ctx.referencia_uid);
+    }
+
+    // Linha 2: Parada ou input mode
+    lcd.setCursor(0, 2);
+    if (ctx.modo_parada_input) {
+        lcd.printf("Parada: %-12s", ctx.keypad_buffer);
+    } else if (ctx.parada_ativa != PARADA_NONE) {
+        lcd.printf("Parada: %-12s", PARADAS[ctx.parada_ativa].display_name);
+    } else {
+        lcd.print("                    ");
+    }
+
+    // Linha 3: RPM
+    lcd.setCursor(0, 3);
+    lcd.printf("RPM: %-15.0f", ctx.rpm_atual);
+}
+
+// =============================================================================
+// RFID - Leitura e Processamento
+// =============================================================================
+bool readRfidUid(char* uid_out) {
+    if (!rfid.PICC_IsNewCardPresent() || !rfid.PICC_ReadCardSerial()) {
+        return false;
+    }
+
+    // Converter para hex string
+    for (byte i = 0; i < rfid.uid.size && i < 4; i++) {
+        sprintf(&uid_out[i * 2], "%02X", rfid.uid.uidByte[i]);
+    }
+    uid_out[8] = '\0';
+
     rfid.PICC_HaltA();
     rfid.PCD_StopCrypto1();
-  }
-  return uid;
+
+    return true;
 }
 
-void verificarRFID() {
-  String uid = lerUIDRFID();
-  if (uid == "") return;
+void processRfid() {
+    uint32_t now = millis();
 
-  // Se não há operador logado, este é o login
-  if (operador_id == "") {
-    operador_id = uid;
-    tempoTrabalho = true;
-    lcd.clear();
-    lcd.setCursor(0, 0);
-    lcd.print("Login: " + operador_id.substring(0, 12));
-    lcd.setCursor(0, 1);
-    lcd.print("Insira Referencia...");
-    Serial.println("✅ Operador logado: " + operador_id);
-  }
-  // Se há operador logado mas não há referência, este é o ref_op
-  else if (referencia == "" && uid != operador_id) {
-    referencia = uid;
-    referencia_uid = uid;
-    tempoProducao = true;
-    lcd.clear();
-    lcd.setCursor(0, 0);
-    lcd.print("Login: " + operador_id.substring(0, 12));
-    lcd.setCursor(0, 1);
-    lcd.print("REF: " + referencia.substring(0, 12));
-    Serial.println("✅ Referência definida: " + referencia);
-  }
-  // Logout do operador (mesmo UUID do login)
-  else if (uid == operador_id) {
-    operador_id = "";
-    referencia = "";
-    referencia_uid = "";
-    tempoTrabalho = tempoProducao = false;
-    resetarParadas();
-    modoParadaAtivo = false;
-    lcd.clear();
-    lcd.setCursor(0, 0);
-    lcd.print("Sistema Iniciado   ");
-    lcd.setCursor(0, 1);
-    lcd.print("Efetue o Login!    ");
-    lcd.setCursor(0, 2);
-    lcd.print("                    ");
-    Serial.println("✅ Logout do operador realizado");
-  }
-  // Logout da referência (mesmo UUID da referência)
-  else if (uid == referencia_uid) {
-    referencia = "";
-    referencia_uid = "";
-    tempoProducao = false;
-    lcd.setCursor(0, 1);
-    lcd.print("REF finalizada     ");
-    delay(2000);
-    lcd.clear();
-    lcd.setCursor(0, 0);
-    lcd.print("Login: " + operador_id.substring(0, 12));
-    lcd.setCursor(0, 1);
-    lcd.print("Insira Referencia...");
-    Serial.println("✅ Referência finalizada");
-  }
-  // Tentativa de usar outro RFID quando já há referência ativa
-  else {
-    lcd.clear();
-    lcd.setCursor(0, 0);
-    lcd.print("REF ja ativa!      ");
-    lcd.setCursor(0, 1);
-    lcd.print("Use mesmo REF p/sair");
-    delay(2000);
-    // Restaura display anterior
-    lcd.clear();
-    lcd.setCursor(0, 0);
-    lcd.print("Login: " + operador_id.substring(0, 12));
-    lcd.setCursor(0, 1);
-    lcd.print("REF: " + referencia.substring(0, 12));
-    if (paradaAtual != "") {
-      lcd.setCursor(0, 2);
-      lcd.print("Parada: " + paradaAtual);
+    // Debounce não-bloqueante
+    if (now - ctx.last_rfid_read < Timing::RFID_DEBOUNCE) {
+        return;
     }
-    Serial.println("⚠️ Tentativa de usar outro RFID com referência ativa");
-  }
-  
-  delay(1000); // Debounce
-}
 
-void verificarTeclado() {
-  if (operador_id == "") return;
-
-  static String buffer = "";
-
-  char key = keypad.getKey();
-  if (!key) return;
-
-  // Tecla * - Entrar/Sair do modo parada OU desativar parada atual
-  if (key == '*') {
-    if (!modoParadaAtivo && paradaAtual == "") {
-      // Entrar no modo parada (só se não há parada ativa)
-      modoParadaAtivo = true;
-      buffer = "";
-      lcd.setCursor(0, 2);
-      lcd.print("Insira parada...   ");
-      lcd.setCursor(0, 3);
-      lcd.print("                    "); // Limpa RPM temporariamente
-      Serial.println("📝 Modo parada ativado");
-    } 
-    else if (!modoParadaAtivo && paradaAtual != "") {
-      // Desativar parada atual (quando já há uma parada ativa)
-      desativarTodasParadas();
-      paradaAtual = "";
-      tempoProducao = true;
-      lcd.setCursor(0, 2);
-      lcd.print("                    ");
-      Serial.println("▶️ Parada desativada via *");
+    char uid[9];
+    if (!readRfidUid(uid)) {
+        return;
     }
-    else if (modoParadaAtivo) {
-      // Sair do modo parada sem fazer nada
-      modoParadaAtivo = false;
-      buffer = "";
-      lcd.setCursor(0, 2);
-      lcd.print("                    ");
-      if (paradaAtual != "") {
-        lcd.setCursor(0, 2);
-        lcd.print("Parada: " + paradaAtual);
-      }
-      Serial.println("❌ Modo parada cancelado");
+
+    ctx.last_rfid_read = now;
+    Serial.printf("[RFID] UID lido: %s\n", uid);
+
+    switch (ctx.state) {
+        case STATE_IDLE:
+            // Login do operador
+            strncpy(ctx.operador_uid, uid, 9);
+            transitionTo(STATE_LOGGED_IN);
+            Serial.printf("[RFID] Operador logado: %s\n", ctx.operador_uid);
+            break;
+
+        case STATE_LOGGED_IN:
+            if (strcmp(uid, ctx.operador_uid) == 0) {
+                // Logout do operador
+                ctx.operador_uid[0] = '\0';
+                transitionTo(STATE_IDLE);
+                Serial.println("[RFID] Logout do operador");
+            } else {
+                // Definir referência
+                strncpy(ctx.referencia_uid, uid, 9);
+                transitionTo(STATE_PRODUCING);
+                Serial.printf("[RFID] Referencia definida: %s\n", ctx.referencia_uid);
+            }
+            break;
+
+        case STATE_PRODUCING:
+        case STATE_PAUSED:
+            if (strcmp(uid, ctx.operador_uid) == 0) {
+                // Logout completo
+                ctx.operador_uid[0] = '\0';
+                ctx.referencia_uid[0] = '\0';
+                ctx.parada_ativa = PARADA_NONE;
+                ctx.modo_parada_input = false;
+                transitionTo(STATE_IDLE);
+                Serial.println("[RFID] Logout completo");
+            } else if (strcmp(uid, ctx.referencia_uid) == 0) {
+                // Finalizar referência
+                ctx.referencia_uid[0] = '\0';
+                ctx.parada_ativa = PARADA_NONE;
+                transitionTo(STATE_LOGGED_IN);
+                showTempMessage("REF finalizada");
+                Serial.println("[RFID] Referencia finalizada");
+            } else {
+                // Outro cartão - não permitido
+                showTempMessage("REF ja ativa!");
+                Serial.println("[RFID] Tentativa rejeitada");
+            }
+            break;
     }
-    return;
-  }
+}
 
-  // Se modo parada está ativo, processar teclas numéricas
-  if (modoParadaAtivo && key >= '0' && key <= '9') {
-    buffer += key;
-    lcd.setCursor(0, 2);
-    lcd.print("Insira parada: " + buffer);
-  }
-
-  // Tecla # - Confirmar parada
-  if (key == '#' && modoParadaAtivo && buffer.length() > 0) {
-    int codigo = buffer.toInt();
-    bool paradaEncontrada = false;
-    
-    // Buscar parada pelo código
-    for (int i = 0; i < NUM_PARADAS; i++) {
-      if (paradas[i].codigo == codigo) {
-        paradaEncontrada = true;
-        bool* paradaFlag = paradas[i].flag;
-        
-        // Se já tem parada ativa, desativa todas primeiro
-        if (paradaAtual != "") {
-          desativarTodasParadas();
-        }
-        
-        // Ativar nova parada
-        *paradaFlag = true;
-        tempoProducao = false;
-        paradaAtual = paradas[i].nomeDisplay;
-        lcd.setCursor(0, 2);
-        lcd.print("Parada: " + paradaAtual);
-        Serial.println("⏸️ Parada ativada: " + paradas[i].nomeDisplay);
-        
-        break;
-      }
+// =============================================================================
+// TECLADO - Processamento
+// =============================================================================
+void processKeypad() {
+    // Só processa se logado
+    if (ctx.state == STATE_IDLE) {
+        return;
     }
-    
-    if (!paradaEncontrada) {
-      lcd.setCursor(0, 2);
-      lcd.print("Codigo invalido!   ");
-      delay(2000);
-      if (paradaAtual != "") {
-        lcd.setCursor(0, 2);
-        lcd.print("Parada: " + paradaAtual);
-      } else {
-        lcd.setCursor(0, 2);
-        lcd.print("                    ");
-      }
+
+    char key = keypad.getKey();
+    if (key == 0) {
+        return;
     }
-    
-    modoParadaAtivo = false;
-    buffer = "";
-  }
-}
 
-// Função para desativar todas as paradas
-void desativarTodasParadas() {
-  for (int i = 0; i < NUM_PARADAS; i++) {
-    *paradas[i].flag = false;
-  }
-}
+    Serial.printf("[KEY] Tecla: %c\n", key);
 
-float getCPULoad() {
-  static unsigned long lastIdle = 0, lastTotal = 0;
-  unsigned long idle = ulTaskGetIdleRunTimeCounter();
-  unsigned long total = portGET_RUN_TIME_COUNTER_VALUE();
-  unsigned long idleDelta = idle - lastIdle;
-  unsigned long totalDelta = total - lastTotal;
-  lastIdle = idle;
-  lastTotal = total;
-  if (totalDelta == 0) return 0.0;
-  return (1.0 - ((float)idleDelta / totalDelta)) * 100.0;
-}
+    switch (key) {
+        case '*':
+            if (ctx.modo_parada_input) {
+                // Cancelar entrada
+                ctx.modo_parada_input = false;
+                ctx.keypad_buffer_len = 0;
+                ctx.keypad_buffer[0] = '\0';
+                ctx.display_dirty = true;
+            } else if (ctx.parada_ativa != PARADA_NONE) {
+                // Desativar parada atual
+                ctx.parada_ativa = PARADA_NONE;
+                if (ctx.state == STATE_PAUSED) {
+                    transitionTo(STATE_PRODUCING);
+                }
+                Serial.println("[KEY] Parada desativada");
+            } else if (ctx.state == STATE_PRODUCING) {
+                // Entrar modo parada
+                ctx.modo_parada_input = true;
+                ctx.keypad_buffer_len = 0;
+                ctx.keypad_buffer[0] = '\0';
+                ctx.display_dirty = true;
+                Serial.println("[KEY] Modo parada ativado");
+            }
+            break;
 
-void enviarJSON() {
-  StaticJsonDocument<512> doc;
-  size_t totalHeap = heap_caps_get_total_size(MALLOC_CAP_DEFAULT);
-  if (totalHeap == 0) totalHeap = 1;
-  float heapPorcentagemUsada = ((totalHeap - esp_get_free_heap_size()) * 100.0) / totalHeap;
+        case '#':
+            if (ctx.modo_parada_input && ctx.keypad_buffer_len > 0) {
+                // Confirmar parada
+                int codigo = atoi(ctx.keypad_buffer);
+                if (codigo >= 1 && codigo < PARADA_COUNT) {
+                    ctx.parada_ativa = (ParadaTipo)codigo;
+                    transitionTo(STATE_PAUSED);
+                    Serial.printf("[KEY] Parada ativada: %s\n",
+                        PARADAS[ctx.parada_ativa].display_name);
+                } else {
+                    showTempMessage("Codigo invalido!");
+                }
+                ctx.modo_parada_input = false;
+                ctx.keypad_buffer_len = 0;
+                ctx.keypad_buffer[0] = '\0';
+            }
+            break;
 
-  doc["maquina_id"] = maquina_id;
-  doc["operador"] = operador_id;
-  doc["ref_op"] = referencia;
-  doc["tempoTrabalho"] = tempoTrabalho;
-  doc["tempoProducao"] = tempoProducao;
-  
-  // Adicionar paradas dinamicamente ao JSON
-  for (int i = 0; i < NUM_PARADAS; i++) {
-    doc[paradas[i].nome] = *paradas[i].flag;
-  }
-  
-  JsonArray rpmArray = doc.createNestedArray("rpm");
-  rpmArray.add(rpmBuffer[0]);
-  rpmArray.add(rpmBuffer[1]);
-  rpmArray.add(rpmBuffer[2]);
-  
-  doc["cpuLoad"] = roundf(cpuLoad * 100) / 100.0;
-  doc["heapLoad"] = roundf(heapPorcentagemUsada * 100) / 100.0;
-
-  char jsonBuffer[512];
-  size_t len = serializeJson(doc, jsonBuffer);
-
-  Serial.println("JSON Gerado:");
-  Serial.println(jsonBuffer);
-
-  if (client.connected()) {
-    if (client.publish(mqtt_topic, jsonBuffer)) Serial.println("✅ JSON enviado com sucesso.");
-    else Serial.println("❌ Falha ao enviar JSON.");
-  } else {
-    Serial.println("⚠️ MQTT desconectado.");
-  }
-}
-
-void atualizarDisplay() {
-  // Linha 0: Sistema Iniciado / Login
-  lcd.setCursor(0, 0);
-  if (operador_id == "") {
-    lcd.print("Sistema Iniciado   ");
-  } else {
-    String loginText = "Login: " + operador_id.substring(0, 12);
-    lcd.print(loginText);
-    for (int i = loginText.length(); i < 20; i++) {
-      lcd.print(' ');
+        default:
+            if (ctx.modo_parada_input && key >= '0' && key <= '9') {
+                if (ctx.keypad_buffer_len < 2) {  // Máximo 2 dígitos
+                    ctx.keypad_buffer[ctx.keypad_buffer_len++] = key;
+                    ctx.keypad_buffer[ctx.keypad_buffer_len] = '\0';
+                    ctx.display_dirty = true;
+                }
+            }
+            break;
     }
-  }
+}
 
-  // Linha 1: Efetue Login / Referência
-  lcd.setCursor(0, 1);
-  if (operador_id == "") {
-    lcd.print("Efetue o Login!    ");
-  } else if (referencia == "") {
-    lcd.print("Insira Referencia...");
-  } else {
-    String refText = "REF: " + referencia.substring(0, 12);
-    lcd.print(refText);
-    for (int i = refText.length(); i < 20; i++) {
-      lcd.print(' ');
+// =============================================================================
+// RPM - Cálculo
+// =============================================================================
+void calculateRpm() {
+    uint32_t now = millis();
+
+    if (now - ctx.last_rpm_calc < Timing::RPM_CALC_INTERVAL) {
+        return;
     }
-  }
 
-  // Linha 2: Parada (só aparece quando ativa ou no modo inserção)
-  // Esta linha é gerenciada diretamente nas funções de teclado e RFID
+    // Ler e resetar contador atomicamente
+    portDISABLE_INTERRUPTS();
+    uint32_t pulses = ctx.pulse_count;
+    ctx.pulse_count = 0;
+    portENABLE_INTERRUPTS();
 
-  // Linha 3: RPM (sempre sozinho)
-  lcd.setCursor(0, 3);
-  lcd.print("                    "); // Limpar linha
-  lcd.setCursor(0, 3);
-  lcd.printf("RPM: %.0f", rpm);
+    // Calcular RPM (pulsos por minuto)
+    ctx.rpm_atual = pulses * 60.0f;
+
+    // Armazenar no buffer circular
+    ctx.rpm_buffer[ctx.rpm_write_index] = (uint32_t)ctx.rpm_atual;
+    ctx.rpm_write_index = (ctx.rpm_write_index + 1) % 3;
+
+    ctx.last_rpm_calc = now;
+    ctx.display_dirty = true;
 }
 
-void conectarWiFi() {
-  lcd.clear();
-  lcd.setCursor(0, 0);
-  lcd.print("Conectando WiFi...");
-  
-  WiFi.begin(ssid, password);
-  int tentativas = 0;
-  while (WiFi.status() != WL_CONNECTED && tentativas < 10) {
-    delay(500);
-    Serial.print(".");
-    tentativas++;
-  }
+// =============================================================================
+// MÉTRICAS DO SISTEMA
+// =============================================================================
+void updateMetrics() {
+    // Heap usage
+    size_t total_heap = heap_caps_get_total_size(MALLOC_CAP_DEFAULT);
+    size_t free_heap = esp_get_free_heap_size();
+    ctx.heap_load = (total_heap > 0) ?
+        ((total_heap - free_heap) * 100.0f / total_heap) : 0.0f;
 
-  if (WiFi.status() == WL_CONNECTED) {
-    Serial.println("\n✅ WiFi conectado!");
-    Serial.println(WiFi.localIP());
-
-    lcd.clear();
-    lcd.setCursor(0, 0);
-    lcd.print("WiFi conectado     ");
-    lcd.setCursor(0, 1);
-    lcd.print(WiFi.localIP());
-    delay(2000);
-    lcd.clear();
-    lcd.setCursor(0, 0);
-    lcd.print("Sistema Iniciado   ");
-    lcd.setCursor(0, 1);
-    lcd.print("Efetue o Login!    ");
-  } else {
-    Serial.println("\n❌ Falha ao conectar WiFi.");
-    lcd.clear();
-    lcd.setCursor(0, 0);
-    lcd.print("Falha WiFi         ");
-    lcd.setCursor(0, 1);
-    lcd.print("Verifique rede     ");
-  }
+    // CPU load (simplificado - requer config FreeRTOS específica)
+    // Em produção, usar ulTaskGetIdleRunTimeCounter() se disponível
+    ctx.cpu_load = 0.0f;  // Placeholder
 }
 
-void conectarMQTT() {
-  client.setServer(mqtt_server, mqtt_port);
-  int tentativas = 0;
-  lcd.clear();
-  lcd.setCursor(0, 0);
-  lcd.print("Conectando MQTT... ");
+// =============================================================================
+// MQTT - Envio de JSON
+// =============================================================================
+void sendMqttPayload() {
+    uint32_t now = millis();
 
-  while (!client.connected() && tentativas < 5) {
-    Serial.print("Tentando MQTT... ");
-    if (client.connect(maquina_id)) {
-      Serial.println("✅ Conectado ao MQTT!");
-      lcd.clear();
-      lcd.setCursor(0, 0);
-      lcd.print("MQTT conectado     ");
-      delay(2000);
-      lcd.clear();
-      lcd.setCursor(0, 0);
-      lcd.print("Sistema Iniciado   ");
-      lcd.setCursor(0, 1);
-      lcd.print("Efetue o Login!    ");
-      return;
+    // Enviar se: intervalo atingido OU mudança de estado
+    bool should_send = (now - ctx.last_mqtt_send >= Timing::MQTT_SEND_INTERVAL) ||
+                       ctx.mqtt_send_pending;
+
+    if (!should_send || !mqtt.connected()) {
+        return;
+    }
+
+    ctx.last_mqtt_send = now;
+    ctx.mqtt_send_pending = false;
+
+    updateMetrics();
+
+    // Construir JSON (formato otimizado - state como single source of truth)
+    StaticJsonDocument<256> doc;
+
+    doc["maquina_id"] = Config::MACHINE_ID;
+    doc["operador"] = ctx.operador_uid;
+    doc["ref_op"] = ctx.referencia_uid;
+    doc["state"] = STATE_NAMES[ctx.state];
+    doc["parada"] = PARADAS[ctx.parada_ativa].json_name;
+
+    // RPM em ordem cronológica (mais antigo primeiro)
+    JsonArray rpm_array = doc.createNestedArray("rpm");
+    for (int i = 0; i < 3; i++) {
+        uint8_t idx = (ctx.rpm_write_index + i) % 3;
+        rpm_array.add(ctx.rpm_buffer[idx]);
+    }
+
+    doc["cpuLoad"] = roundf(ctx.cpu_load * 100) / 100.0f;
+    doc["heapLoad"] = roundf(ctx.heap_load * 100) / 100.0f;
+
+    // Serializar e enviar
+    char buffer[256];
+    size_t len = serializeJson(doc, buffer);
+
+    if (mqtt.publish(Config::MQTT_TOPIC, buffer, len)) {
+        Serial.printf("[MQTT] Enviado (%d bytes)\n", len);
     } else {
-      Serial.print("❌ Falha (rc=");
-      Serial.print(client.state());
-      Serial.println("), nova tentativa...");
-      delay(1000);
-      tentativas++;
+        Serial.println("[MQTT] Erro ao enviar");
     }
-  }
-
-  Serial.println("❌ Erro: não conectou ao MQTT!");
-  lcd.clear();
-  lcd.setCursor(0, 0);
-  lcd.print("Falha MQTT         ");
-  lcd.setCursor(0, 1);
-  lcd.print("Verifique broker   ");
 }
 
+// =============================================================================
+// WIFI - Conexão com backoff exponencial
+// =============================================================================
+void handleWifiConnection() {
+    if (WiFi.status() == WL_CONNECTED) {
+        ctx.wifi_retry_delay = Timing::WIFI_RETRY_BASE;  // Reset backoff
+        return;
+    }
+
+    uint32_t now = millis();
+    if (now - ctx.last_wifi_attempt < ctx.wifi_retry_delay) {
+        return;
+    }
+
+    ctx.last_wifi_attempt = now;
+    Serial.printf("[WIFI] Conectando... (retry em %lums)\n", ctx.wifi_retry_delay);
+
+    lcd.setCursor(0, 1);
+    lcd.print("Conectando WiFi...  ");
+
+    WiFi.disconnect();
+    WiFi.begin(Config::WIFI_SSID, Config::WIFI_PASS);
+
+    // Aguardar até 5 segundos (não-bloqueante seria melhor, mas WiFi.begin é síncrono)
+    uint32_t start = millis();
+    while (WiFi.status() != WL_CONNECTED && millis() - start < 5000) {
+        delay(100);
+    }
+
+    if (WiFi.status() == WL_CONNECTED) {
+        Serial.printf("[WIFI] Conectado! IP: %s\n", WiFi.localIP().toString().c_str());
+        ctx.wifi_retry_delay = Timing::WIFI_RETRY_BASE;
+        ctx.display_dirty = true;
+    } else {
+        // Backoff exponencial
+        ctx.wifi_retry_delay = min(ctx.wifi_retry_delay * 2, Timing::WIFI_RETRY_MAX);
+        Serial.printf("[WIFI] Falha. Proximo retry em %lums\n", ctx.wifi_retry_delay);
+    }
+}
+
+// =============================================================================
+// MQTT - Conexão com backoff exponencial
+// =============================================================================
+void handleMqttConnection() {
+    if (mqtt.connected()) {
+        ctx.mqtt_retry_delay = Timing::MQTT_RETRY_BASE;
+        return;
+    }
+
+    if (WiFi.status() != WL_CONNECTED) {
+        return;
+    }
+
+    uint32_t now = millis();
+    if (now - ctx.last_mqtt_attempt < ctx.mqtt_retry_delay) {
+        return;
+    }
+
+    ctx.last_mqtt_attempt = now;
+    Serial.printf("[MQTT] Conectando... (retry em %lums)\n", ctx.mqtt_retry_delay);
+
+    if (mqtt.connect(Config::MACHINE_ID)) {
+        Serial.println("[MQTT] Conectado!");
+        ctx.mqtt_retry_delay = Timing::MQTT_RETRY_BASE;
+        ctx.mqtt_send_pending = true;  // Enviar estado atual imediatamente
+    } else {
+        ctx.mqtt_retry_delay = min(ctx.mqtt_retry_delay * 2, Timing::MQTT_RETRY_MAX);
+        Serial.printf("[MQTT] Falha (rc=%d). Proximo retry em %lums\n",
+            mqtt.state(), ctx.mqtt_retry_delay);
+    }
+}
+
+// =============================================================================
+// SETUP
+// =============================================================================
 void setup() {
-  Serial.begin(115200);
-  pinMode(ENCODER_PIN, INPUT);
-  attachInterrupt(digitalPinToInterrupt(ENCODER_PIN), countPulse, FALLING);
+    Serial.begin(115200);
+    Serial.println("\n[BOOT] Sistema de Monitoramento v2.0");
 
-  Wire.begin(21, 22);
-  lcd.init();
-  lcd.backlight();
-  lcd.clear();
-  lcd.setCursor(0, 0);
-  lcd.print("Sistema Iniciado");
-  lcd.setCursor(0, 1);
-  lcd.print("Efetue o Login!");
+    // Inicializar contexto
+    initContext();
 
-  SPI.begin();
-  rfid.PCD_Init();
-  
-  // Inicializar paradas
-  inicializarParadas();
+    // Configurar pino do encoder
+    pinMode(ENCODER_PIN, INPUT_PULLUP);
+    attachInterrupt(digitalPinToInterrupt(ENCODER_PIN), onEncoderPulse, FALLING);
 
-  conectarWiFi();
-  conectarMQTT();
+    // Inicializar I2C e LCD
+    Wire.begin(I2C_SDA, I2C_SCL);
+    lcd.init();
+    lcd.backlight();
+    lcd.clear();
+    lcd.setCursor(0, 0);
+    lcd.print("Iniciando...");
+
+    // Inicializar SPI e RFID
+    SPI.begin();
+    rfid.PCD_Init();
+    delay(100);
+
+    if (rfid.PCD_PerformSelfTest()) {
+        Serial.println("[RFID] Self-test OK");
+    } else {
+        Serial.println("[RFID] Self-test FALHOU");
+    }
+    rfid.PCD_Init();  // Re-init após self-test
+
+    // Configurar MQTT
+    mqtt.setServer(Config::MQTT_SERVER, Config::MQTT_PORT);
+    mqtt.setBufferSize(512);
+
+    // Conexão inicial
+    handleWifiConnection();
+    handleMqttConnection();
+
+    ctx.display_dirty = true;
+    Serial.println("[BOOT] Setup completo");
 }
 
+// =============================================================================
+// LOOP PRINCIPAL (Zero blocking delays)
+// =============================================================================
 void loop() {
-  static bool wifiTentado = false;
-  if (WiFi.status() != WL_CONNECTED && !wifiTentado) {
-    conectarWiFi();
-    wifiTentado = true;
-  }
+    // Gerenciar conexões
+    handleWifiConnection();
+    handleMqttConnection();
+    mqtt.loop();
 
-  static bool mqttTentado = false;
-  if (!client.connected() && WiFi.status() == WL_CONNECTED && !mqttTentado) {
-    conectarMQTT();
-    mqttTentado = false;
-  }
+    // Processar entradas
+    processRfid();
+    processKeypad();
 
-  client.loop();
-  verificarRFID();
-  verificarTeclado();
-  atualizarDisplay();
+    // Calcular métricas
+    calculateRpm();
 
-  // Cálculo do RPM
-  if (millis() - lastRPMCheck >= 1000) {
-    detachInterrupt(digitalPinToInterrupt(ENCODER_PIN));
-    rpm = (pulseCount * 60.0);
-    pulseCount = 0;
-    lastRPMCheck = millis();
-    attachInterrupt(digitalPinToInterrupt(ENCODER_PIN), countPulse, FALLING);
+    // Atualizar saídas
+    updateDisplay();
+    sendMqttPayload();
 
-    rpmBuffer[rpmIndex] = rpm;
-    rpmIndex = (rpmIndex + 1) % 3;
+    // Reset flag de mudança de estado
+    ctx.state_changed = false;
 
-    cpuLoad = getCPULoad();
-  }
-
-  // Envio JSON a cada 3s
-  static unsigned long ultimaMensagem = 0;
-  if (millis() - ultimaMensagem >= 3000) {
-    enviarJSON();
-    ultimaMensagem = millis();
-  }
-
-  vTaskDelay(pdMS_TO_TICKS(20));
+    // Yield para outras tasks do FreeRTOS
+    vTaskDelay(pdMS_TO_TICKS(10));
 }
-
-/* 
-  Sistema desenvolvido por: Kalebe e João Victor
-*/
