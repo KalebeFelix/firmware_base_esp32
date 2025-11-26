@@ -192,7 +192,9 @@ Keypad keypad = Keypad(makeKeymap(keypad_keys), keypad_row_pins, keypad_col_pins
 // ISR - CONTAGEM DE PULSOS (Otimizada)
 // =============================================================================
 void IRAM_ATTR onEncoderPulse() {
-    ctx.pulse_count++;
+    if (digitalRead(ENCODER_PIN) == LOW) {
+        ctx.pulse_count++;
+    }
 }
 
 // =============================================================================
@@ -645,7 +647,7 @@ void setup() {
     initContext();
 
     // Configurar pino do encoder
-    pinMode(ENCODER_PIN, INPUT_PULLUP);
+    pinMode(ENCODER_PIN, INPUT);
     attachInterrupt(digitalPinToInterrupt(ENCODER_PIN), onEncoderPulse, FALLING);
 
     // Inicializar I2C e LCD
