@@ -311,7 +311,9 @@ void updateDisplay() {
 
     // Linha 3: RPM
     lcd.setCursor(0, 3);
-    lcd.printf("RPM: %-15.0f", ctx.rpm_atual);
+    lcd.print("RPM: ");
+    lcd.print((int)ctx.rpm_atual);
+    lcd.print("               ");  // Limpar resto da linha
 }
 
 // =============================================================================
