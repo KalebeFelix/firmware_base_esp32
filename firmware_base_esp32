@@ -544,36 +544,19 @@ void calculateRpm() {
 // =============================================================================
 // MÉTRICAS DO SISTEMA
 // =============================================================================
-void updateMetrics() {
-    static uint32_t last_measure = 0;
-    static uint32_t last_work_time = 0;
+void updateMetrics(uint32_t active_time_us) {
     static uint32_t work_accumulator = 0;
-
-    uint32_t now = micros();  // Usar micros() para maior precisão
-
-    // Acumular tempo de trabalho (tempo desde último loop até vTaskDelay)
-    if (last_measure > 0) {
-        uint32_t delta = now - last_measure;
-        work_accumulator += delta;
-    }
-
-    last_measure = now;
-
-    // Calcular CPU load a cada 100ms (janela de medição)
     static uint32_t last_calc = 0;
-    if (millis() - last_calc >= 100) {
-        // Janela de 100ms = 100000µs
-        // Se o loop roda a cada ~10ms, temos ~10 iterações
-        // Cada iteração "trabalha" e depois dorme 10ms
+
+    work_accumulator += active_time_us;
+
+    // Calcular CPU load a cada 1000ms (janela de medição)
+    if (millis() - last_calc >= 1000) {
         // CPU load = (tempo_trabalhando / tempo_total) * 100
-
-        float work_time_ms = work_accumulator / 1000.0f;
-        float window_ms = 100.0f;
-
-        // Descontar o tempo de vTaskDelay (10ms por iteração, ~10 iterações)
-        float sleep_time_ms = 100.0f;  // Aproximadamente 10 iterações * 10ms
-
-        ctx.cpu_load = constrain((work_time_ms / window_ms) * 100.0f, 0.0f, 100.0f);
+        // Janela de 1s = 1,000,000us
+        
+        ctx.cpu_load = (work_accumulator / 1000000.0f) * 100.0f;
+        if (ctx.cpu_load > 100.0f) ctx.cpu_load = 100.0f;
 
         work_accumulator = 0;
         last_calc = millis();
@@ -646,6 +629,7 @@ void handleWifiConnection() {
     if (status == WL_CONNECTED) {
         if (connecting) {
             DEBUG_PRINTF("[WIFI] Conectado! IP: %s\n", WiFi.localIP().toString().c_str());
+            showTempMessage("WiFi Conectado!");
             ctx.display_dirty = true;
             connecting = false;
         }
@@ -769,6 +753,8 @@ void setup() {
 // LOOP PRINCIPAL (Zero blocking delays)
 // =============================================================================
 void loop() {
+    uint32_t start_work = micros();
+
     // Gerenciar conexões
     handleWifiConnection();
     handleMqttConnection();
@@ -780,7 +766,7 @@ void loop() {
 
     // Calcular métricas
     calculateRpm();
-    updateMetrics();  // Atualizar continuamente para leitura suave de CPU load
+    // updateMetrics movido para o final para contabilizar tempo total
 
     // Atualizar saídas
     updateDisplay();
@@ -788,6 +774,10 @@ void loop() {
 
     // Reset flag de mudança de estado
     ctx.state_changed = false;
+
+    // Calcular tempo ativo antes de dormir
+    uint32_t active_time = micros() - start_work;
+    updateMetrics(active_time);
 
     // Yield para outras tasks do FreeRTOS
     vTaskDelay(pdMS_TO_TICKS(10));
