@@ -1,7 +1,7 @@
 /**
  * =============================================================================
  * SISTEMA DE MONITORAMENTO DE PRODUÇÃO - ESP32
- * Versão: 2.0.0 (Refactored)
+ * Versão: 2.1.0 (Production-Ready + NTP Sync)
  * =============================================================================
  *
  * Arquitetura:
@@ -13,6 +13,7 @@
  * - Display com dirty flag (atualiza só quando necessário)
  * - ISR otimizada sem leituras redundantes
  * - Envio condicional de payload (mudança de estado OU intervalo)
+ * - SINCRONIZAÇÃO NTP: Envio MQTT em múltiplos exatos de 3s (00:00:00, 00:00:03, 00:00:06...)
  *
  * Desenvolvedores: Kalebe Felix, João Victor
  * Refatoração: João Ícaro
@@ -27,9 +28,11 @@
 #include <SPI.h>
 #include <MFRC522.h>
 #include <ArduinoJson.h>
+#include <time.h>
 #include "esp_heap_caps.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "esp_sntp.h"
 
 // =============================================================================
 // CONFIGURAÇÃO DE DEBUG
@@ -69,6 +72,12 @@ namespace Config {
     const char* MQTT_SERVER  = "192.168.1.100";
     const uint16_t MQTT_PORT = 1883;
     const char* MQTT_TOPIC   = "producao/maquinas";
+
+    // Configuração NTP
+    const char* NTP_SERVER1  = "pool.ntp.org";
+    const char* NTP_SERVER2  = "time.nist.gov";
+    const long  GMT_OFFSET   = -3 * 3600;  // UTC-3 (Brasília)
+    const int   DST_OFFSET   = 0;          // Sem horário de verão
 }
 
 // =============================================================================
@@ -76,7 +85,7 @@ namespace Config {
 // =============================================================================
 namespace Timing {
     const uint32_t RPM_CALC_INTERVAL    = 1000;   // Calcular RPM a cada 1s
-    const uint32_t MQTT_SEND_INTERVAL   = 3000;   // Enviar MQTT a cada 3s
+    const uint32_t MQTT_SEND_INTERVAL   = 3000;   // Enviar MQTT a cada 3s (sincronizado)
     const uint32_t DISPLAY_REFRESH      = 250;    // Atualizar display 4x/s
     const uint32_t RFID_POLL_INTERVAL   = 100;    // Polling RFID 10x/s
     const uint32_t RFID_DEBOUNCE        = 1500;   // Debounce RFID
@@ -85,6 +94,7 @@ namespace Timing {
     const uint32_t MQTT_RETRY_BASE      = 2000;   // Base retry MQTT
     const uint32_t MQTT_RETRY_MAX       = 30000;  // Max retry MQTT
     const uint32_t LCD_MESSAGE_DURATION = 2000;   // Mensagens temporárias
+    const uint32_t NTP_SYNC_CHECK       = 3600000; // Verificar sincronização NTP a cada 1h
 }
 
 // =============================================================================
@@ -158,6 +168,12 @@ typedef struct {
     uint32_t last_wifi_attempt;
     uint32_t last_mqtt_attempt;
     uint32_t temp_message_start;
+    uint32_t last_ntp_check;
+
+    // Sincronização NTP
+    time_t last_ntp_sync_unix;      // Timestamp Unix da última sincronização
+    uint32_t next_mqtt_milestone;   // Próximo múltiplo de 3s para envio MQTT
+    bool ntp_synced;                // Flag de sincronização NTP ativa
 
     // Backoff exponencial
     uint32_t wifi_retry_delay;
@@ -229,6 +245,90 @@ void initContext() {
     ctx.display_dirty = true;
     ctx.wifi_retry_delay = Timing::WIFI_RETRY_BASE;
     ctx.mqtt_retry_delay = Timing::MQTT_RETRY_BASE;
+    ctx.ntp_synced = false;
+}
+
+// =============================================================================
+// SINCRONIZAÇÃO NTP
+// =============================================================================
+void syncNTP() {
+    DEBUG_PRINTLN("[NTP] Iniciando sincronização...");
+
+    // Configurar SNTP
+    configTime(Config::GMT_OFFSET, Config::DST_OFFSET,
+               Config::NTP_SERVER1, Config::NTP_SERVER2);
+
+    // Aguardar sincronização (timeout de 10s, não-bloqueante em produção)
+    time_t now = 0;
+    struct tm timeinfo;
+    int retry = 0;
+    const int MAX_RETRIES = 50;  // 50 × 200ms = 10s
+
+    while (retry++ < MAX_RETRIES) {
+        time(&now);
+        localtime_r(&now, &timeinfo);
+
+        // Verificar se ano é válido (>= 2020)
+        if (timeinfo.tm_year >= (2020 - 1900)) {
+            ctx.ntp_synced = true;
+            ctx.last_ntp_sync_unix = now;
+            ctx.last_ntp_check = millis();
+
+            // Calcular próximo múltiplo de 3s
+            time_t current_unix = now;
+            ctx.next_mqtt_milestone = ((current_unix / 3) + 1) * 3;
+
+            DEBUG_PRINTF("[NTP] Sincronizado! Data: %02d/%02d/%04d %02d:%02d:%02d\n",
+                timeinfo.tm_mday, timeinfo.tm_mon + 1, timeinfo.tm_year + 1900,
+                timeinfo.tm_hour, timeinfo.tm_min, timeinfo.tm_sec);
+            DEBUG_PRINTF("[NTP] Próximo envio MQTT em: %ld (múltiplo de 3s)\n",
+                ctx.next_mqtt_milestone);
+
+            showTempMessage("NTP Sincronizado!");
+            return;
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(200));
+    }
+
+    // Falha na sincronização - sistema continua funcionando com millis()
+    ctx.ntp_synced = false;
+    DEBUG_PRINTLN("[NTP] FALHA na sincronização! Usando millis()");
+    showTempMessage("NTP Falhou!");
+}
+
+// Verificar e ressincronizar NTP periodicamente
+void checkNTPSync() {
+    // Só verifica se WiFi está conectado
+    if (WiFi.status() != WL_CONNECTED) {
+        return;
+    }
+
+    uint32_t now = millis();
+
+    // Verificar a cada hora se precisa ressincronizar
+    if (now - ctx.last_ntp_check < Timing::NTP_SYNC_CHECK) {
+        return;
+    }
+
+    ctx.last_ntp_check = now;
+
+    // Verificar se hora ainda é válida
+    time_t current_unix;
+    time(&current_unix);
+    struct tm timeinfo;
+    localtime_r(&current_unix, &timeinfo);
+
+    if (timeinfo.tm_year < (2020 - 1900)) {
+        // Perdeu sincronização - tentar novamente
+        DEBUG_PRINTLN("[NTP] Sincronização perdida! Ressincronizando...");
+        ctx.ntp_synced = false;
+        syncNTP();
+    } else {
+        DEBUG_PRINTF("[NTP] Ainda sincronizado. Data: %02d/%02d/%04d %02d:%02d:%02d\n",
+            timeinfo.tm_mday, timeinfo.tm_mon + 1, timeinfo.tm_year + 1900,
+            timeinfo.tm_hour, timeinfo.tm_min, timeinfo.tm_sec);
+    }
 }
 
 // =============================================================================
@@ -570,26 +670,63 @@ void updateMetrics(uint32_t active_time_us) {
 }
 
 // =============================================================================
-// MQTT - Envio de JSON
+// MQTT - Envio de JSON (SINCRONIZADO COM NTP)
 // =============================================================================
 void sendMqttPayload() {
-    uint32_t now = millis();
-
-    // Enviar se: intervalo atingido OU mudança de estado
-    bool should_send = (now - ctx.last_mqtt_send >= Timing::MQTT_SEND_INTERVAL) ||
-                       ctx.mqtt_send_pending;
-
-    if (!should_send || !mqtt.connected()) {
+    if (!mqtt.connected()) {
         return;
     }
 
-    ctx.last_mqtt_send = now;
+    bool should_send = false;
+
+    // Modo SINCRONIZADO (com NTP) - Envia exatamente em múltiplos de 3s
+    if (ctx.ntp_synced) {
+        time_t current_unix;
+        time(&current_unix);
+
+        // Verificar se atingiu o próximo múltiplo de 3s
+        if (current_unix >= ctx.next_mqtt_milestone || ctx.mqtt_send_pending) {
+            should_send = true;
+
+            // Calcular próximo múltiplo de 3s
+            ctx.next_mqtt_milestone = ((current_unix / 3) + 1) * 3;
+
+            DEBUG_PRINTF("[MQTT] Envio sincronizado em %ld (próximo: %ld)\n",
+                current_unix, ctx.next_mqtt_milestone);
+        }
+    }
+    // Modo FALLBACK (sem NTP) - Usa millis() tradicional
+    else {
+        uint32_t now = millis();
+        should_send = (now - ctx.last_mqtt_send >= Timing::MQTT_SEND_INTERVAL) ||
+                      ctx.mqtt_send_pending;
+
+        if (should_send) {
+            ctx.last_mqtt_send = now;
+            DEBUG_PRINTLN("[MQTT] Envio fallback (sem NTP)");
+        }
+    }
+
+    if (!should_send) {
+        return;
+    }
+
     ctx.mqtt_send_pending = false;
 
     // Construir JSON (formato otimizado - state como single source of truth)
     StaticJsonDocument<256> doc;
 
     doc["maquina_id"] = Config::MACHINE_ID;
+
+    // Timestamp sincronizado (Unix epoch em segundos)
+    if (ctx.ntp_synced) {
+        time_t current_unix;
+        time(&current_unix);
+        doc["timestamp"] = current_unix;
+    } else {
+        doc["timestamp"] = 0;  // 0 indica que não está sincronizado
+    }
+
     doc["operador"] = ctx.operador_uid;
     doc["ref_op"] = ctx.referencia_uid;
     doc["state"] = STATE_NAMES[ctx.state];
@@ -743,6 +880,20 @@ void setup() {
 
     // Conexão inicial
     handleWifiConnection();
+
+    // Aguardar WiFi conectar antes de sincronizar NTP (timeout 10s)
+    int wifi_retry = 0;
+    while (WiFi.status() != WL_CONNECTED && wifi_retry++ < 50) {
+        delay(200);
+    }
+
+    // Sincronizar NTP se WiFi conectou
+    if (WiFi.status() == WL_CONNECTED) {
+        syncNTP();
+    } else {
+        DEBUG_PRINTLN("[NTP] Pulando - WiFi não conectado");
+    }
+
     handleMqttConnection();
 
     ctx.display_dirty = true;
@@ -759,6 +910,9 @@ void loop() {
     handleWifiConnection();
     handleMqttConnection();
     mqtt.loop();
+
+    // Verificar sincronização NTP periodicamente
+    checkNTPSync();
 
     // Processar entradas
     processRfid();
